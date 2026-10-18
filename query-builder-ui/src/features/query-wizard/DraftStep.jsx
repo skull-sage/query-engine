@@ -36,7 +36,8 @@ export default function DraftStep({ state, derived, onYamlChange, nameWarning })
             {i < PARAM_TYPES.length - 1 ? ', ' : ''}
           </span>
         ))}
-        . Allowed roles are chosen when you publish.
+        . Optional <code className="font-mono">fetchSize</code> sets how many rows are read from the database at a time when a client
+        streams the result. Allowed roles are chosen when you publish.
       </p>
 
       {nameWarning && <Alert variant="warning">{nameWarning}</Alert>}

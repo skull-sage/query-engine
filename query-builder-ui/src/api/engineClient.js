@@ -33,7 +33,52 @@ function isEngineErrorBody(body) {
   return body && typeof body === 'object' && typeof body.error === 'string' && 'message' in body && !('timestamp' in body)
 }
 
+/** JSON.parse that returns null for an empty body and undefined when the body isn't JSON. */
+function parseJson(text) {
+  if (!text) return null
+  try {
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
+
 export function createEngineClient({ baseUrl, serviceLabel }) {
+  /** Builds the EngineError for a non-2xx response from its parsed body. */
+  function errorFromResponse(status, parsed) {
+    if (isEngineErrorBody(parsed)) {
+      return new EngineError({
+        status,
+        code: parsed.error,
+        message: parsed.message || `${serviceLabel} rejected the request (HTTP ${status}).`,
+        queryName: parsed.queryName ?? null,
+        body: parsed,
+      })
+    }
+    // No engine error body. An empty 5xx is the dev-server proxy saying it couldn't connect
+    // (502); anything else came from the framework rather than the engine's error handling.
+    const proxyFailure = status >= 500 && (parsed === null || parsed === undefined)
+    const detail = parsed && typeof parsed === 'object' ? parsed.message || parsed.error : null
+    let message
+    if (proxyFailure) message = `Can't reach ${serviceLabel}. Check that the service is running (./dry-run.sh).`
+    else if (status < 500) message = `${serviceLabel} rejected the request (HTTP ${status})${detail ? `: ${detail}` : '.'}`
+    else message = `${serviceLabel} failed to handle the request (HTTP ${status}). Check the service logs.`
+    return new EngineError({
+      status,
+      code: proxyFailure ? CLIENT_ERRORS.SERVICE_UNREACHABLE : CLIENT_ERRORS.SERVICE_ERROR,
+      message,
+      body: parsed ?? null,
+    })
+  }
+
+  function unreachable() {
+    return new EngineError({
+      status: 0,
+      code: CLIENT_ERRORS.SERVICE_UNREACHABLE,
+      message: `Can't reach ${serviceLabel}. Check that the service is running (./dry-run.sh).`,
+    })
+  }
+
   async function request(path, { method = 'POST', body, headers = {}, signal } = {}) {
     let res
     try {
@@ -45,49 +90,12 @@ export function createEngineClient({ baseUrl, serviceLabel }) {
       })
     } catch (err) {
       if (isAbortError(err)) throw err
-      throw new EngineError({
-        status: 0,
-        code: CLIENT_ERRORS.SERVICE_UNREACHABLE,
-        message: `Can't reach ${serviceLabel}. Check that the service is running (./dry-run.sh).`,
-      })
+      throw unreachable()
     }
 
     const text = await res.text()
-    let parsed = null
-    if (text) {
-      try {
-        parsed = JSON.parse(text)
-      } catch {
-        parsed = undefined // not JSON
-      }
-    }
-
-    if (!res.ok) {
-      if (isEngineErrorBody(parsed)) {
-        throw new EngineError({
-          status: res.status,
-          code: parsed.error,
-          message: parsed.message || `${serviceLabel} rejected the request (HTTP ${res.status}).`,
-          queryName: parsed.queryName ?? null,
-          body: parsed,
-        })
-      }
-      // No engine error body. An empty 5xx is the dev-server proxy saying it couldn't connect
-      // (502); anything else came from the framework rather than the engine's error handling.
-      const proxyFailure = res.status >= 500 && (parsed === null || parsed === undefined)
-      const detail = parsed && typeof parsed === 'object' ? parsed.message || parsed.error : null
-      let message
-      if (proxyFailure) message = `Can't reach ${serviceLabel}. Check that the service is running (./dry-run.sh).`
-      else if (res.status < 500) message = `${serviceLabel} rejected the request (HTTP ${res.status})${detail ? `: ${detail}` : '.'}`
-      else message = `${serviceLabel} failed to handle the request (HTTP ${res.status}). Check the service logs.`
-      throw new EngineError({
-        status: res.status,
-        code: proxyFailure ? CLIENT_ERRORS.SERVICE_UNREACHABLE : CLIENT_ERRORS.SERVICE_ERROR,
-        message,
-        body: parsed ?? null,
-      })
-    }
-
+    const parsed = parseJson(text)
+    if (!res.ok) throw errorFromResponse(res.status, parsed)
     if (parsed === undefined) {
       throw new EngineError({
         status: res.status,
@@ -127,6 +135,28 @@ export function createEngineClient({ baseUrl, serviceLabel }) {
     invoke: (name, params, roles, opts) =>
       request('/data-query', { body: { name, params }, headers: { 'X-Roles': roles }, ...opts }),
 
+    /**
+     * POST /data-query with Accept: application/x-ndjson. Resolves with the Response once the
+     * status is known (non-2xx is thrown as an EngineError before any body is read); the caller
+     * reads response.body at its own pace, and the server only sends as fast as it is read.
+     */
+    openStream: async (name, params, roles, { signal } = {}) => {
+      let res
+      try {
+        res = await fetch(`${baseUrl}/data-query`, {
+          method: 'POST',
+          headers: { Accept: 'application/x-ndjson', 'Content-Type': 'application/json', 'X-Roles': roles },
+          body: JSON.stringify({ name, params }),
+          signal,
+        })
+      } catch (err) {
+        if (isAbortError(err)) throw err
+        throw unreachable()
+      }
+      if (!res.ok) throw errorFromResponse(res.status, parseJson(await res.text()))
+      if (!res.body) throw new EngineError({ status: res.status, code: CLIENT_ERRORS.BAD_RESPONSE, message: 'This browser cannot stream response bodies.' })
+      return res
+    },
     /** GET /query-roles -> { realmRoles: [{ name, description }], groups: [{ name, path, description }] } */
     getRoles: (opts) => request('/query-roles', { method: 'GET', ...opts }),
   }

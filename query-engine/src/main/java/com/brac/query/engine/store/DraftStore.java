@@ -29,15 +29,16 @@ public class DraftStore {
 
     private static final String UPSERT = """
             INSERT INTO query_draft
-                (query_name, sql_text, params, allowed_roles, validated_query,
+                (query_name, sql_text, params, allowed_roles, fetch_size, validated_query,
                  status, errors, simulated, author, updated_at, expires_at)
             VALUES
-                (:queryName, :sqlText, :params, :allowedRoles, :validatedQuery,
+                (:queryName, :sqlText, :params, :allowedRoles, :fetchSize, :validatedQuery,
                  :status, :errors, :simulated, :author, :updatedAt, :expiresAt)
             ON CONFLICT (query_name) DO UPDATE SET
                 sql_text = EXCLUDED.sql_text,
                 params = EXCLUDED.params,
                 allowed_roles = EXCLUDED.allowed_roles,
+                fetch_size = EXCLUDED.fetch_size,
                 validated_query = EXCLUDED.validated_query,
                 status = EXCLUDED.status,
                 errors = EXCLUDED.errors,
@@ -75,6 +76,9 @@ public class DraftStore {
                 .bind("updatedAt", toOffset(record.updatedAt()))
                 .bind("expiresAt", toOffset(record.expiresAt()));
 
+        spec = record.entry().fetchSize() == null
+                ? spec.bindNull("fetchSize", Integer.class)
+                : spec.bind("fetchSize", record.entry().fetchSize());
         spec = record.validatedQuery() == null
                 ? spec.bindNull("validatedQuery", Json.class)
                 : spec.bind("validatedQuery", jsonb.toJson(record.validatedQuery()));
@@ -108,7 +112,8 @@ public class DraftStore {
                 jsonb.fromJson(row.get("params", Json.class), new TypeReference<Map<String, String>>() {
                 }),
                 jsonb.fromJson(row.get("allowed_roles", Json.class), new TypeReference<List<String>>() {
-                })
+                }),
+                row.get("fetch_size", Integer.class)
         );
         ValidatedQuery validatedQuery = jsonb.fromJson(row.get("validated_query", Json.class), ValidatedQuery.class);
         List<ValidationError> errors = jsonb.fromJson(row.get("errors", Json.class), new TypeReference<List<ValidationError>>() {

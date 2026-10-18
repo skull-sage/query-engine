@@ -1,4 +1,4 @@
-import { useMatch, useNavigate } from 'react-router-dom'
+import { useLocation, useMatch, useNavigate } from 'react-router-dom'
 import { DOMAINS, findDomain } from '../domains.js'
 import { useRequestLeave } from '../context/LeaveGuard.jsx'
 
@@ -7,7 +7,8 @@ import { useRequestLeave } from '../context/LeaveGuard.jsx'
  * which remounts the workspace for the new domain; unsaved wizard edits get a confirm first.
  */
 export default function AppHeader() {
-  const match = useMatch('/:domainKey')
+  const match = useMatch('/:domainKey/*')
+  const { pathname } = useLocation()
   const current = findDomain(match?.params.domainKey)
   const navigate = useNavigate()
   const requestLeave = useRequestLeave()
@@ -18,6 +19,14 @@ export default function AppHeader() {
     requestLeave(() => navigate(`/${key}`))
   }
 
+  const onDemo = pathname.endsWith('/downstream-demo')
+  const navItems = current
+    ? [
+        { label: 'Queries', to: `/${current.key}`, active: !onDemo },
+        ...(current.streamDemo ? [{ label: 'Downstream demo', to: `/${current.key}/downstream-demo`, active: onDemo }] : []),
+      ]
+    : []
+
   return (
     <header className="sticky top-0 z-40 border-b border-slate-200 bg-white/90 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-6xl items-center justify-between gap-4 px-4 sm:px-6 lg:px-8">
@@ -26,6 +35,23 @@ export default function AppHeader() {
             Q
           </span>
           <span className="text-base font-semibold text-slate-900">Query Builder</span>
+          {navItems.length > 0 && (
+            <nav aria-label="Sections" className="ml-4 flex items-center gap-1">
+              {navItems.map((item) => (
+                <button
+                  key={item.to}
+                  type="button"
+                  aria-current={item.active ? 'page' : undefined}
+                  onClick={() => !item.active && requestLeave(() => navigate(item.to))}
+                  className={`rounded-md px-3 py-1.5 text-sm font-medium focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600 ${
+                    item.active ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100 hover:text-slate-900'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              ))}
+            </nav>
+          )}
         </div>
 
         <div className="flex items-center gap-3">

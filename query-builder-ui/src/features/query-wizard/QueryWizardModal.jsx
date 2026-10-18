@@ -337,7 +337,7 @@ function Footer({ state, derived, actions }) {
 }
 
 function draftToYaml(draft) {
-  const entry = draft.entry || { sql: draft.validatedQuery?.sql, params: paramListToMap(draft.validatedQuery?.params) }
+  const entry = draft.entry || { sql: draft.validatedQuery?.sql, params: paramListToMap(draft.validatedQuery?.params), fetchSize: draft.validatedQuery?.fetchSize }
   return entryToYaml(draft.queryName, entry)
 }
 

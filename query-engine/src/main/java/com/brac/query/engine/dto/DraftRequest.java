@@ -11,6 +11,7 @@ public record DraftRequest(
         @NotBlank String queryName,
         @NotBlank String sql,
         Map<String, String> params,
-        @JsonProperty("allowed_roles") List<String> allowedRoles
+        @JsonProperty("allowed_roles") List<String> allowedRoles,
+        Integer fetchSize
 ) {
 }

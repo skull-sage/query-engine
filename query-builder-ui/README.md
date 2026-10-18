@@ -47,4 +47,8 @@ The dev server uses a fixed port (5173, `strictPort`) and fails if it's taken, i
 - `src/features/query-wizard/` — `wizardState.js` (reducer and step gating), the three step components, and the dialog that
   runs the requests and recovers when the server's draft has moved on (expired, re-saved elsewhere, no longer simulated).
 - `src/features/run-query/RunQueryModal.jsx` — the run dialog.
+- `src/features/downstream-demo/` — the "Downstream demo" page (nav item, shown for domains with a `streamDemo` in
+  `src/domains.js`, currently OrderQuery). It publishes `orders.historyByDate` if missing, then streams it from
+  `/data-query` as NDJSON, reading 100 rows per 100 ms (adjustable) and checking the count and row order at the end.
+  It keeps counters only, never the rows. Leaving the page aborts the request.
 - `src/pages/` — `DomainSelectPage` (first visit), `QueryListPage` (main view).

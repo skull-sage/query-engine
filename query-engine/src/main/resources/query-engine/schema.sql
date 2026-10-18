@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS published_query (
     published_by     VARCHAR(255)  NOT NULL
 );
 
+-- Optional rows-per-round-trip for reading a query through a database cursor (null = the service
+-- default). Added with ALTER so databases created before this column existed keep working.
+ALTER TABLE query_draft     ADD COLUMN IF NOT EXISTS fetch_size INT;
+ALTER TABLE published_query ADD COLUMN IF NOT EXISTS fetch_size INT;
+
 -- Identity catalog consulted by the UI when publishing a query (to choose which realm roles and
 -- groups may invoke it) and when running a published query (to pick an identity to call as). In a
 -- real deployment this mirrors the enterprise identity provider (e.g. Keycloak realm roles and

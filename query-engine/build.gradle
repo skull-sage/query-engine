@@ -33,6 +33,7 @@ dependencies {
 	api 'org.springframework.boot:spring-boot-starter-validation'
 	// Reactive Postgres driver. JsonbSupport references io.r2dbc.postgresql.codec.Json directly.
 	implementation 'org.postgresql:r2dbc-postgresql'
+	implementation 'io.r2dbc:r2dbc-pool'
 	implementation 'tools.jackson.dataformat:jackson-dataformat-yaml'
 
 	testImplementation 'org.springframework.boot:spring-boot-starter-webflux-test'

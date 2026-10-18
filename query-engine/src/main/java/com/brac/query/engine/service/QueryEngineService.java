@@ -1,5 +1,8 @@
 package com.brac.query.engine.service;
 
+import com.brac.query.engine.config.SimulateProperties;
+import com.brac.query.engine.config.StreamProperties;
+import com.brac.query.engine.execution.ProjectionException;
 import com.brac.query.engine.validation.QueryValidator;
 import com.brac.query.engine.execution.ProjectionStoreExecutor;
 import com.brac.query.engine.dto.DraftRequest;
@@ -52,13 +55,18 @@ public class QueryEngineService {
     private final PublishedQueryRepository publishedQueries;
     private final QueryValidator validator;
     private final ProjectionStoreExecutor executor;
+    private final StreamProperties streamProperties;
+    private final SimulateProperties simulateProperties;
 
     public QueryEngineService(DraftStore draftStore, PublishedQueryRepository publishedQueries, QueryValidator validator,
-                               ProjectionStoreExecutor executor) {
+                               ProjectionStoreExecutor executor, StreamProperties streamProperties,
+                               SimulateProperties simulateProperties) {
         this.draftStore = draftStore;
         this.publishedQueries = publishedQueries;
         this.validator = validator;
         this.executor = executor;
+        this.streamProperties = streamProperties;
+        this.simulateProperties = simulateProperties;
     }
 
     public Mono<DraftResponse> draft(DraftRequest request, String author) {
@@ -77,7 +85,7 @@ public class QueryEngineService {
                     });
 
             return lockCheck.then(Mono.defer(() -> {
-                QueryEntry entry = new QueryEntry(request.sql(), request.params(), request.allowedRoles());
+                QueryEntry entry = new QueryEntry(request.sql(), request.params(), request.allowedRoles(), request.fetchSize());
                 var validationResult = validator.validate(entry);
                 Instant expiresAt = now.plus(DRAFT_TTL);
                 DraftStatus status = validationResult.hasErrors() ? DraftStatus.DRAFT : DraftStatus.VALIDATED;
@@ -115,7 +123,10 @@ public class QueryEngineService {
 
                 // Stand-in for: OPA policy evaluation (row/field redaction), then execution against
                 // the real Projection Store (Postgres) under the row-cap cost limiter.
-                return executor.execute(record.validatedQuery(), params).flatMap(execResult -> {
+                int fetchSize = streamProperties.effectiveFetchSize(record.validatedQuery().fetchSize());
+                return executor.execute(queryName, record.validatedQuery(), params, simulateProperties.maxRows(), fetchSize)
+                        .onErrorMap(ProjectionException.class, e -> e.toEngineException(queryName, true))
+                        .flatMap(execResult -> {
                     Instant now = Instant.now();
                     Instant expiresAt = now.plus(DRAFT_TTL);
                     var metrics = new SimulateResponse.Metrics(
@@ -160,9 +171,10 @@ public class QueryEngineService {
                 }
 
                 QueryEntry publishedEntry = new QueryEntry(
-                        record.entry().sql(), record.entry().params(), allowedRoles);
+                        record.entry().sql(), record.entry().params(), allowedRoles, record.entry().fetchSize());
                 ValidatedQuery publishedValidated = new ValidatedQuery(
-                        record.validatedQuery().sql(), record.validatedQuery().params(), allowedRoles);
+                        record.validatedQuery().sql(), record.validatedQuery().params(), allowedRoles,
+                        record.validatedQuery().fetchSize());
 
                 Instant now = Instant.now();
                 PublishedQuery published = new PublishedQuery(queryName, publishedEntry, publishedValidated, now, publishedBy);
@@ -212,6 +224,7 @@ public class QueryEngineService {
 
                     ListResponse.PublishedSummary publishedSummary = published == null ? null : new ListResponse.PublishedSummary(
                             published.validatedQuery().sql(), published.validatedQuery().params(),
+                            published.validatedQuery().fetchSize(),
                             published.validatedQuery().allowedRoles(), published.publishedAt(), published.publishedBy()
                     );
                     ListResponse.DraftSummary draftSummary = draft == null ? null : new ListResponse.DraftSummary(
@@ -231,10 +244,11 @@ public class QueryEngineService {
     }
 
     /**
-     * Runtime invocation (Phase 2): resolves the published query, applies the operation-level
-     * RBAC gate, validates params, and executes against the projection store -- all reactive.
+     * Everything a {@code /data-query} call must satisfy before any data is read: the query exists,
+     * the caller's roles are allowed, and the params are present and correctly typed. Reading the
+     * rows is {@link DataQueryService}'s job.
      */
-    public Mono<InvocationResult> invoke(String name, Map<String, Object> params, List<String> callerRoles) {
+    public Mono<Invocation> prepareInvocation(String name, Map<String, Object> params, List<String> callerRoles) {
         return resolveQueryName(name).flatMap(queryName -> publishedQueries.find(queryName)
                 .switchIfEmpty(Mono.error(new EngineException("QUERY_NOT_FOUND", HttpStatus.NOT_FOUND, queryName,
                         "No published query named '" + queryName + "'")))
@@ -242,21 +256,16 @@ public class QueryEngineService {
                     List<String> allowedRoles = published.validatedQuery().allowedRoles();
                     boolean permitted = callerRoles.stream().anyMatch(allowedRoles::contains);
                     if (!permitted) {
-                        return Mono.error(new EngineException("FORBIDDEN", HttpStatus.FORBIDDEN, queryName,
+                        return Mono.<Invocation>error(new EngineException("FORBIDDEN", HttpStatus.FORBIDDEN, queryName,
                                 "Role(s) " + callerRoles + " not permitted to invoke '" + queryName + "'"));
                     }
 
                     EngineException paramError = validateInvokeParams(queryName, published.validatedQuery(), params);
                     if (paramError != null) {
-                        return Mono.error(paramError);
+                        return Mono.<Invocation>error(paramError);
                     }
-
-                    return executor.execute(published.validatedQuery(), params)
-                            .map(execResult -> new InvocationResult(queryName, execResult.rows()));
+                    return Mono.just(new Invocation(queryName, published.validatedQuery(), params));
                 }));
-    }
-
-    public record InvocationResult(String queryName, List<Map<String, Object>> rows) {
     }
 
     /** Accepts either a bare name ("orderById") or a fully namespaced one ("orders.orderById"). */
@@ -286,7 +295,7 @@ public class QueryEngineService {
         return new DraftResponse(
                 record.queryName(), record.status().name(), record.validatedQuery(),
                 record.errors(), record.expiresAt(),
-                new DraftResponse.Entry(record.entry().sql(), record.entry().params()),
+                new DraftResponse.Entry(record.entry().sql(), record.entry().params(), record.entry().fetchSize()),
                 record.simulated());
     }
 

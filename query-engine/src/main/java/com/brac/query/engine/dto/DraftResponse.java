@@ -25,6 +25,6 @@ public record DraftResponse(
         boolean simulated
 ) {
 
-    public record Entry(String sql, Map<String, String> params) {
+    public record Entry(String sql, Map<String, String> params, Integer fetchSize) {
     }
 }

@@ -76,3 +76,17 @@ POST {{baseUrl}}/engine/list
 Content-Type: application/json
 
 {}
+
+### Streaming. Needs the 50,000-row demo query (open the UI's "Downstream demo" page once, or draft,
+### simulate and publish orders.historyByDate with fetchSize 100 and allowed role data-platform).
+### Accept: application/x-ndjson streams one row per line, read from Postgres only as fast as the
+### client reads. Without it, the same call returns 413 RESULT_TOO_LARGE (JSON is capped at 1000 rows).
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+Accept: application/x-ndjson
+X-Roles: data-platform
+
+{
+  "name": "orders.historyByDate",
+  "params": { "since": "2026-01-01" }
+}

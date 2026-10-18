@@ -1,6 +1,7 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
+import dockerStats from './vite-plugins/dockerStats.js'
 
 // Each domain query service gets its own path prefix on the dev server, proxied to that service
 // with the prefix stripped: /api/order/engine/list -> http://localhost:8081/engine/list. The UI
@@ -23,7 +24,8 @@ const proxy = Object.fromEntries(
 )
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  // dockerStats serves /__dev/stats (dev server only) for the Downstream demo's resource monitor.
+  plugins: [react(), tailwindcss(), dockerStats()],
   server: {
     port: 5173,
     // Fail instead of silently moving to 5174 when a stale dev server still holds 5173.

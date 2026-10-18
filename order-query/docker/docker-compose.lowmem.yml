@@ -1,0 +1,10 @@
+# Constrains the order-query container so memory use under a large /data-query stream is
+# observable: with a 192 MB heap, buffering the 50K-row result (about 30 MB of text, several
+# times that as Java objects) would fail, so a flat run shows the stream is demand-driven.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.lowmem.yml up -d order-query
+services:
+  order-query:
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx192m"
+    mem_limit: 320m

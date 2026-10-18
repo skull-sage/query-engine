@@ -13,6 +13,7 @@ public record ListResponse(List<Item> items, String nextCursor) {
     public record PublishedSummary(
             String sql,
             List<ParamSpec> params,
+            Integer fetchSize,
             List<String> allowedRoles,
             Instant publishedAt,
             String publishedBy

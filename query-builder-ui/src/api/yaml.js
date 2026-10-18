@@ -1,6 +1,6 @@
 import yaml from 'js-yaml'
 
-// The editor works on a small YAML document: { queryName, sql, params }. allowed_roles are not
+// The editor works on a small YAML document: { queryName, sql, params, fetchSize? }. allowed_roles are not
 // part of it; they're chosen at publish time.
 
 /** Parses editor YAML into the POST /engine/draft body. Throws an Error with a readable message. */
@@ -14,7 +14,7 @@ export function yamlToDraftEntry(yamlText) {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('The YAML must be a mapping with queryName, sql and params.')
   }
-  const { queryName, sql, params } = parsed
+  const { queryName, sql, params, fetchSize } = parsed
   if (typeof queryName !== 'string' || !queryName.trim()) throw new Error('queryName is required.')
   if (typeof sql !== 'string' || !sql.trim()) throw new Error('sql is required.')
   if (params != null && (typeof params !== 'object' || Array.isArray(params))) {
@@ -25,7 +25,13 @@ export function yamlToDraftEntry(yamlText) {
     if (typeof type !== 'string') throw new Error(`params.${name} must be a type name such as String or int.`)
     normalizedParams[name] = type
   }
-  return { queryName: queryName.trim(), sql, params: normalizedParams }
+  const entry = { queryName: queryName.trim(), sql, params: normalizedParams }
+  // Optional; the engine validates the range and reports INVALID_FETCH_SIZE on the draft.
+  if (fetchSize != null) {
+    if (typeof fetchSize !== 'number' || !Number.isInteger(fetchSize)) throw new Error('fetchSize must be a whole number, e.g. "fetchSize: 500".')
+    entry.fetchSize = fetchSize
+  }
+  return entry
 }
 
 /** Best-effort read of queryName from editor YAML; null while the YAML is incomplete. */
@@ -39,7 +45,7 @@ export function peekQueryName(yamlText) {
 }
 
 /** Builds editor YAML from a draft entry or published query: { sql, params: { name: type } }. */
-export function entryToYaml(queryName, { sql, params }) {
+export function entryToYaml(queryName, { sql, params, fetchSize }) {
   const lines = [`queryName: ${scalar(queryName)}`, 'sql: |-']
   for (const line of String(sql || '').trim().split('\n')) {
     lines.push(`  ${line.trimEnd()}`)
@@ -51,6 +57,7 @@ export function entryToYaml(queryName, { sql, params }) {
     lines.push('params:')
     for (const [name, type] of entries) lines.push(`  ${scalar(name)}: ${scalar(type)}`)
   }
+  if (fetchSize != null) lines.push(`fetchSize: ${fetchSize}`)
   return `${lines.join('\n')}\n`
 }
 

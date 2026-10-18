@@ -1,5 +1,6 @@
 package com.brac.query.engine.validation;
 
+import com.brac.query.engine.config.StreamProperties;
 import com.brac.query.engine.model.ParamSpec;
 import com.brac.query.engine.model.ParamType;
 import com.brac.query.engine.model.QueryEntry;
@@ -24,6 +25,12 @@ import java.util.regex.Pattern;
 public class QueryValidator {
 
     private static final Pattern PARAM_TOKEN = Pattern.compile(":([a-zA-Z_][a-zA-Z0-9_]*)");
+
+    private final StreamProperties streamProperties;
+
+    public QueryValidator(StreamProperties streamProperties) {
+        this.streamProperties = streamProperties;
+    }
 
     public ValidationResult validate(QueryEntry entry) {
         List<ValidationError> errors = new ArrayList<>();
@@ -63,6 +70,12 @@ public class QueryValidator {
             errors.add(new ValidationError("MISSING_SQL", null, "sql is required"));
         }
 
+        Integer fetchSize = entry.fetchSize();
+        if (fetchSize != null && (fetchSize < 1 || fetchSize > streamProperties.maxFetchSize())) {
+            errors.add(new ValidationError("INVALID_FETCH_SIZE", null,
+                    "fetchSize must be between 1 and " + streamProperties.maxFetchSize() + " (got " + fetchSize + ")"));
+        }
+
         if (!errors.isEmpty()) {
             return new ValidationResult(null, params, errors);
         }
@@ -70,7 +83,8 @@ public class QueryValidator {
         ValidatedQuery validated = new ValidatedQuery(
                 entry.sql(),
                 params,
-                entry.allowedRoles() == null ? List.of() : entry.allowedRoles()
+                entry.allowedRoles() == null ? List.of() : entry.allowedRoles(),
+                fetchSize
         );
         return new ValidationResult(validated, params, errors);
     }

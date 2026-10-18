@@ -1,10 +1,16 @@
 package com.brac.query.engine;
 
+import com.brac.query.engine.config.ProjectionPoolProperties;
+import com.brac.query.engine.config.SimulateProperties;
+import com.brac.query.engine.config.StreamProperties;
+import com.brac.query.engine.execution.ProjectionDatabase;
 import io.r2dbc.spi.ConnectionFactory;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ComponentScan;
+import org.springframework.core.env.Environment;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.r2dbc.connection.init.ConnectionFactoryInitializer;
 import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator;
@@ -21,10 +27,21 @@ import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator;
  */
 @AutoConfiguration
 @ComponentScan(basePackageClasses = QueryEngineAutoConfiguration.class)
+@EnableConfigurationProperties({StreamProperties.class, ProjectionPoolProperties.class, SimulateProperties.class})
 public class QueryEngineAutoConfiguration {
 
     /** Classpath location of the engine's DDL + identity catalog seed. */
     public static final String SCHEMA_LOCATION = "query-engine/schema.sql";
+
+    /**
+     * The pool used to read projection data (simulate and {@code /data-query}), separate from the
+     * service's main pool so slow streaming clients cannot starve the engine's own calls. See
+     * {@link ProjectionDatabase}.
+     */
+    @Bean(destroyMethod = "dispose")
+    public ProjectionDatabase projectionDatabase(Environment environment, ProjectionPoolProperties pool, StreamProperties stream) {
+        return ProjectionDatabase.create(environment, pool, stream);
+    }
 
     /**
      * Runs {@link #SCHEMA_LOCATION} on startup. Every statement in it is idempotent. Set

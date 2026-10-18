@@ -88,7 +88,7 @@ export default function QueryListPage() {
 
   function onRowAction(action, item) {
     setActionError(null)
-    const fallbackEntry = item.published ? { sql: item.published.sql, params: paramListToMap(item.published.params) } : null
+    const fallbackEntry = item.published ? { sql: item.published.sql, params: paramListToMap(item.published.params), fetchSize: item.published.fetchSize } : null
     switch (action) {
       case 'edit':
       case 'simulate':

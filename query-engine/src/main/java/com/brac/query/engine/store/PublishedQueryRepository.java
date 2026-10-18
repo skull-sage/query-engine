@@ -26,15 +26,16 @@ public class PublishedQueryRepository {
 
     private static final String UPSERT = """
             INSERT INTO published_query
-                (query_name, sql_text, params, allowed_roles, validated_query,
+                (query_name, sql_text, params, allowed_roles, fetch_size, validated_query,
                  published_at, published_by)
             VALUES
-                (:queryName, :sqlText, :params, :allowedRoles, :validatedQuery,
+                (:queryName, :sqlText, :params, :allowedRoles, :fetchSize, :validatedQuery,
                  :publishedAt, :publishedBy)
             ON CONFLICT (query_name) DO UPDATE SET
                 sql_text = EXCLUDED.sql_text,
                 params = EXCLUDED.params,
                 allowed_roles = EXCLUDED.allowed_roles,
+                fetch_size = EXCLUDED.fetch_size,
                 validated_query = EXCLUDED.validated_query,
                 published_at = EXCLUDED.published_at,
                 published_by = EXCLUDED.published_by
@@ -56,15 +57,20 @@ public class PublishedQueryRepository {
     }
 
     public Mono<Void> publish(PublishedQuery publishedQuery) {
-        return db.sql(UPSERT)
+        DatabaseClient.GenericExecuteSpec spec = db.sql(UPSERT)
                 .bind("queryName", publishedQuery.queryName())
                 .bind("sqlText", publishedQuery.entry().sql())
                 .bind("params", jsonb.toJson(publishedQuery.entry().params()))
                 .bind("allowedRoles", jsonb.toJson(publishedQuery.entry().allowedRoles()))
                 .bind("validatedQuery", jsonb.toJson(publishedQuery.validatedQuery()))
                 .bind("publishedAt", publishedQuery.publishedAt().atOffset(ZoneOffset.UTC))
-                .bind("publishedBy", publishedQuery.publishedBy())
-                .fetch().rowsUpdated().then();
+                .bind("publishedBy", publishedQuery.publishedBy());
+
+        spec = publishedQuery.entry().fetchSize() == null
+                ? spec.bindNull("fetchSize", Integer.class)
+                : spec.bind("fetchSize", publishedQuery.entry().fetchSize());
+
+        return spec.fetch().rowsUpdated().then();
     }
 
     public Flux<PublishedQuery> findAll() {
@@ -85,7 +91,8 @@ public class PublishedQueryRepository {
                 jsonb.fromJson(row.get("params", Json.class), new TypeReference<Map<String, String>>() {
                 }),
                 jsonb.fromJson(row.get("allowed_roles", Json.class), new TypeReference<List<String>>() {
-                })
+                }),
+                row.get("fetch_size", Integer.class)
         );
         ValidatedQuery validatedQuery = jsonb.fromJson(row.get("validated_query", Json.class), ValidatedQuery.class);
         return new PublishedQuery(
