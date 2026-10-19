@@ -30,7 +30,6 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Mono;
 
-import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -48,9 +47,6 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 @Service
 public class QueryEngineService {
-
-    private static final Duration DRAFT_TTL = Duration.ofDays(7);
-
     private final DraftStore draftStore;
     private final PublishedQueryRepository publishedQueries;
     private final QueryValidator validator;
@@ -76,10 +72,10 @@ public class QueryEngineService {
 
             Mono<Void> lockCheck = draftStore.find(queryName)
                     .flatMap(existing -> {
-                        if (!existing.isExpired(now) && !existing.author().equals(author)) {
+                        if (!existing.author().equals(author)) {
                             return Mono.<Void>error(new EngineException("DRAFT_LOCKED", HttpStatus.CONFLICT, queryName,
                                     "Draft for '" + queryName + "' is held by " + existing.author()
-                                            + " (expires " + existing.expiresAt() + ")"));
+                                            + ". It stays locked until they publish or discard it."));
                         }
                         return Mono.empty();
                     });
@@ -87,12 +83,11 @@ public class QueryEngineService {
             return lockCheck.then(Mono.defer(() -> {
                 QueryEntry entry = new QueryEntry(request.sql(), request.params(), request.allowedRoles(), request.fetchSize());
                 var validationResult = validator.validate(entry);
-                Instant expiresAt = now.plus(DRAFT_TTL);
                 DraftStatus status = validationResult.hasErrors() ? DraftStatus.DRAFT : DraftStatus.VALIDATED;
 
                 DraftRecord record = new DraftRecord(
                         queryName, entry, validationResult.validatedQuery(), status,
-                        validationResult.errors(), false, author, now, expiresAt
+                        validationResult.errors(), false, author, now
                 );
                 return draftStore.save(record).thenReturn(toDraftResponse(record));
             }));
@@ -128,15 +123,14 @@ public class QueryEngineService {
                         .onErrorMap(ProjectionException.class, e -> e.toEngineException(queryName, true))
                         .flatMap(execResult -> {
                     Instant now = Instant.now();
-                    Instant expiresAt = now.plus(DRAFT_TTL);
                     var metrics = new SimulateResponse.Metrics(
                             execResult.latencyMs(),
                             execResult.rows().size(),
                             Math.round(ThreadLocalRandom.current().nextDouble(1, 50) * 100) / 100.0
                     );
                     SimulateResponse response = new SimulateResponse(queryName, execResult.rows(),
-                            execResult.rows().size(), execResult.truncated(), metrics, List.of(), expiresAt);
-                    return draftStore.save(record.withSimulated(now, expiresAt)).thenReturn(response);
+                            execResult.rows().size(), execResult.truncated(), metrics, List.of());
+                    return draftStore.save(record.withSimulated(now)).thenReturn(response);
                 });
             });
         });
@@ -203,7 +197,7 @@ public class QueryEngineService {
             Mono<Map<String, PublishedQuery>> publishedMono =
                     publishedQueries.findAll().collectMap(PublishedQuery::queryName);
             Mono<Map<String, DraftRecord>> draftMono =
-                    draftStore.findAllNotExpired(now).collectMap(DraftRecord::queryName);
+                    draftStore.findAll().collectMap(DraftRecord::queryName);
 
             return Mono.zip(publishedMono, draftMono).map(tuple -> {
                 Map<String, PublishedQuery> publishedByName = tuple.getT1();
@@ -228,7 +222,7 @@ public class QueryEngineService {
                             published.validatedQuery().allowedRoles(), published.publishedAt(), published.publishedBy()
                     );
                     ListResponse.DraftSummary draftSummary = draft == null ? null : new ListResponse.DraftSummary(
-                            draft.status().name(), draft.simulated(), draft.author(), draft.updatedAt(), draft.expiresAt()
+                            draft.status().name(), draft.simulated(), draft.author(), draft.updatedAt()
                     );
                     items.add(new ListResponse.Item(name, publishedSummary, draftSummary));
                 }
@@ -294,7 +288,7 @@ public class QueryEngineService {
     private static DraftResponse toDraftResponse(DraftRecord record) {
         return new DraftResponse(
                 record.queryName(), record.status().name(), record.validatedQuery(),
-                record.errors(), record.expiresAt(),
+                record.errors(),
                 new DraftResponse.Entry(record.entry().sql(), record.entry().params(), record.entry().fetchSize()),
                 record.simulated());
     }
@@ -369,9 +363,8 @@ public class QueryEngineService {
 
     private Mono<DraftRecord> loadDraftOrThrow(String queryName) {
         return draftStore.find(queryName)
-                .filter(d -> !d.isExpired(Instant.now()))
                 .switchIfEmpty(Mono.error(new EngineException("DRAFT_NOT_FOUND", HttpStatus.NOT_FOUND, queryName,
-                        "No open draft for '" + queryName + "' (never drafted, published, discarded, or expired)")));
+                        "No open draft for '" + queryName + "' (never drafted, published, or discarded)")));
     }
 
     private String requireQueryName(String queryName) {

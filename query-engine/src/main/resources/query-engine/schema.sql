@@ -17,9 +17,10 @@ CREATE TABLE IF NOT EXISTS query_draft (
     errors           JSONB         NOT NULL,
     simulated        BOOLEAN       NOT NULL DEFAULT FALSE,
     author           VARCHAR(255)  NOT NULL,
-    updated_at       TIMESTAMPTZ   NOT NULL,
-    expires_at       TIMESTAMPTZ   NOT NULL
+    updated_at       TIMESTAMPTZ   NOT NULL
 );
+-- Drafts used to expire; they no longer do. Drops the old column from databases created before.
+ALTER TABLE query_draft DROP COLUMN IF EXISTS expires_at;
 
 CREATE TABLE IF NOT EXISTS published_query (
     query_name       VARCHAR(255)  NOT NULL PRIMARY KEY,

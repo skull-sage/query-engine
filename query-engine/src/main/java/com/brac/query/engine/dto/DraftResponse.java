@@ -20,7 +20,6 @@ public record DraftResponse(
         String status,
         ValidatedQuery validatedQuery,
         List<ValidationError> errors,
-        Instant expiresAt,
         Entry entry,
         boolean simulated
 ) {

@@ -30,10 +30,10 @@ public class DraftStore {
     private static final String UPSERT = """
             INSERT INTO query_draft
                 (query_name, sql_text, params, allowed_roles, fetch_size, validated_query,
-                 status, errors, simulated, author, updated_at, expires_at)
+                 status, errors, simulated, author, updated_at)
             VALUES
                 (:queryName, :sqlText, :params, :allowedRoles, :fetchSize, :validatedQuery,
-                 :status, :errors, :simulated, :author, :updatedAt, :expiresAt)
+                 :status, :errors, :simulated, :author, :updatedAt)
             ON CONFLICT (query_name) DO UPDATE SET
                 sql_text = EXCLUDED.sql_text,
                 params = EXCLUDED.params,
@@ -44,8 +44,7 @@ public class DraftStore {
                 errors = EXCLUDED.errors,
                 simulated = EXCLUDED.simulated,
                 author = EXCLUDED.author,
-                updated_at = EXCLUDED.updated_at,
-                expires_at = EXCLUDED.expires_at
+                updated_at = EXCLUDED.updated_at
             """;
 
     private final DatabaseClient db;
@@ -73,8 +72,7 @@ public class DraftStore {
                 .bind("errors", jsonb.toJson(record.errors()))
                 .bind("simulated", record.simulated())
                 .bind("author", record.author())
-                .bind("updatedAt", toOffset(record.updatedAt()))
-                .bind("expiresAt", toOffset(record.expiresAt()));
+                .bind("updatedAt", toOffset(record.updatedAt()));
 
         spec = record.entry().fetchSize() == null
                 ? spec.bindNull("fetchSize", Integer.class)
@@ -92,18 +90,10 @@ public class DraftStore {
                 .fetch().rowsUpdated().then();
     }
 
-    public Flux<DraftRecord> findAllNotExpired(Instant now) {
-        return db.sql("SELECT * FROM query_draft WHERE expires_at > :now")
-                .bind("now", toOffset(now))
+    public Flux<DraftRecord> findAll() {
+        return db.sql("SELECT * FROM query_draft")
                 .map((row, meta) -> toDraftRecord(row))
                 .all();
-    }
-
-    /** Removes expired drafts and returns how many were swept, per PRD "Nobody comes back". */
-    public Mono<Long> sweepExpired(Instant now) {
-        return db.sql("DELETE FROM query_draft WHERE expires_at <= :now")
-                .bind("now", toOffset(now))
-                .fetch().rowsUpdated();
     }
 
     private DraftRecord toDraftRecord(Readable row) {
@@ -126,8 +116,7 @@ public class DraftStore {
                 errors == null ? List.of() : errors,
                 Boolean.TRUE.equals(row.get("simulated", Boolean.class)),
                 row.get("author", String.class),
-                row.get("updated_at", OffsetDateTime.class).toInstant(),
-                row.get("expires_at", OffsetDateTime.class).toInstant()
+                row.get("updated_at", OffsetDateTime.class).toInstant()
         );
     }
 

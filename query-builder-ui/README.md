@@ -45,7 +45,7 @@ The dev server uses a fixed port (5173, `strictPort`) and fails if it's taken, i
 - `src/context/` — `DomainContext` (current domain + client), `LeaveGuard` (confirms before a domain switch would lose
   unsaved wizard edits).
 - `src/features/query-wizard/` — `wizardState.js` (reducer and step gating), the three step components, and the dialog that
-  runs the requests and recovers when the server's draft has moved on (expired, re-saved elsewhere, no longer simulated).
+  runs the requests and recovers when the server's draft has moved on (discarded, re-saved elsewhere, no longer simulated).
 - `src/features/run-query/RunQueryModal.jsx` — the run dialog.
 - `src/features/downstream-demo/` — the "Downstream demo" page (nav item, shown for domains with a `streamDemo` in
   `src/domains.js`, currently OrderQuery). It publishes `orders.historyByDate` if missing, then streams it from

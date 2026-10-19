@@ -4,7 +4,7 @@ import { ensureDemoQuery } from './ensureDemoQuery.js'
 import { splitNdjson } from './ndjson.js'
 
 const PAINT_INTERVAL_MS = 50
-const LOG_LINES = 8
+export const LOG_BATCHES = 8 // how many recent batches the page keeps and shows
 
 export const DEFAULT_SETTINGS = { batchSize: 100, delayMs: 100 }
 
@@ -113,6 +113,7 @@ export function useDownstreamDemo({ client, demo }) {
         if (pending.length === 0) break
 
         const batch = pending.splice(0, batchSize)
+        const ids = []
         for (const line of batch) {
           let row
           try {
@@ -122,13 +123,15 @@ export function useDownstreamDemo({ client, demo }) {
             continue
           }
           rows++
+          ids.push(row[demo.idField])
           if (row[demo.idField] !== `${demo.idPrefix}${String(rows).padStart(6, '0')}`) outOfOrder++
         }
         batches++
         rowsRef.current = rows
 
         const now = performance.now()
-        log = [...log, `batch ${batches}: ${batch.length} rows, total ${rows}`].slice(-LOG_LINES)
+        // One entry per batch: a heading with the first and last id, then every id in the batch.
+        if (ids.length > 0) log = [...log, `Records from ${ids[0]} to ${ids[ids.length - 1]}\n${ids.join(', ')}`].slice(-LOG_BATCHES)
         if (now - lastPaint >= PAINT_INTERVAL_MS) {
           lastPaint = now
           live({ rows, batches, outOfOrder, unparsable, log })

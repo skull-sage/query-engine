@@ -73,7 +73,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
           yaml: entryToYaml(intent.queryName, fallback || { sql: '', params: {} }),
           notice: fallback
             ? `${intent.queryName} has no open draft, so this starts a new one from the published version. The published query keeps serving callers until you publish again.`
-            : `The draft for ${intent.queryName} no longer exists: it expired, was discarded, or was published from elsewhere. Write it again and save to start over.`,
+            : `The draft for ${intent.queryName} no longer exists: it was discarded or published from elsewhere. Write it again and save to start over.`,
         })
       })
     // Re-run only on explicit retry; intent is fixed for the dialog's lifetime.
@@ -86,7 +86,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
     if (error.code === 'DRAFT_NOT_FOUND') {
       dispatch({
         type: 'DRAFT_GONE',
-        message: `${name} no longer has an open draft on ${domain.label}: it expired, was discarded, or was published from elsewhere. Save the draft again to re-create it.`,
+        message: `${name} no longer has an open draft on ${domain.label}: it was discarded or published from elsewhere. Save the draft again to re-create it.`,
       })
       return true
     }

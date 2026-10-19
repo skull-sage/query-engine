@@ -1,11 +1,11 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Alert, { ErrorAlert } from '../../components/Alert.jsx'
 import Button from '../../components/Button.jsx'
 import CopyButton from '../../components/CopyButton.jsx'
 import Spinner from '../../components/Spinner.jsx'
 import { useDomain } from '../../context/DomainContext.jsx'
 import Sparkline from './Sparkline.jsx'
-import { useDownstreamDemo } from './useDownstreamDemo.js'
+import { LOG_BATCHES as LOG_BATCHES_SHOWN, useDownstreamDemo } from './useDownstreamDemo.js'
 import { samplesToCsv, useResourceMonitor } from './useResourceMonitor.js'
 import { useServiceAvailability } from './useServiceAvailability.js'
 
@@ -174,11 +174,23 @@ function Checks({ run, demo }) {
 }
 
 function RecentBatches({ log }) {
+  const box = useRef(null)
+  // Keep the newest batch in view as batches are appended.
+  useEffect(() => {
+    if (box.current) box.current.scrollTop = box.current.scrollHeight
+  }, [log])
   return (
     <section className="rounded-lg bg-white p-5 shadow-sm ring-1 ring-slate-200" aria-label="Recent batches">
       <h2 className="text-sm font-semibold text-slate-900">Recent batches</h2>
-      <pre className="mt-2 min-h-[8rem] overflow-x-auto rounded bg-slate-50 p-3 font-mono text-xs text-slate-700" aria-live="off">
-        {log.length ? log.join('\n') : 'No batches yet.'}
+      <p className="mt-1 text-xs text-slate-500">The last {LOG_BATCHES_SHOWN} batches: the id range, then the ids in it.</p>
+      <pre
+        ref={box}
+        tabIndex={0}
+        className="mt-2 max-h-80 min-h-[8rem] overflow-y-auto whitespace-pre-wrap break-words rounded bg-slate-50 p-3 font-mono text-xs text-slate-700"
+        aria-live="off"
+        aria-label="Recent batches log"
+      >
+        {log.length ? log.join('\n\n') : 'No batches yet.'}
       </pre>
     </section>
   )

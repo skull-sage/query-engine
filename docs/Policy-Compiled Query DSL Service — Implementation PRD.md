@@ -29,8 +29,8 @@ stateDiagram-v2
     DRAFT --> VALIDATED : re-draft succeeds
     VALIDATED --> DRAFT : re-draft with errors
     VALIDATED --> VALIDATED : simulate (records simulated flag)
-    DRAFT --> [*] : discard / draft TTL expires
-    VALIDATED --> [*] : discard / draft TTL expires
+    DRAFT --> [*] : discard
+    VALIDATED --> [*] : discard
     VALIDATED --> PUBLISHED : publish (draft simulated)
     PUBLISHED --> PUBLISHED : publish again\n(overwrites, no versioning)
 ```
@@ -148,16 +148,16 @@ What the code does today (query-engine `0.0.1-SNAPSHOT`, 2026-10-17). The design
 
 **Draft** (`POST /engine/draft`, or `/engine/draft-yml` for YAML bodies; both run the same logic)
 1. `queryName` must match `^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$` (`{module}.{name}`), otherwise `400 INVALID_QUERY_NAME`.
-2. Lock check: an unexpired draft held by a different `X-Author` gives `409 DRAFT_LOCKED`.
+2. Lock check: a draft held by a different `X-Author` gives `409 DRAFT_LOCKED`.
 3. Validation, without parsing SQL: the regex `:([a-zA-Z_][a-zA-Z0-9_]*)` finds the parameter tokens in `sql`, and they are compared with the declared `params`. Problems become `UNDECLARED_PARAM`, `UNUSED_PARAM`, `UNKNOWN_PARAM_TYPE` or `MISSING_SQL` entries in `errors`.
 4. With errors, the draft is stored with `status = DRAFT` and `validated_query = NULL`. Without errors it is `VALIDATED` and carries a `ValidatedQuery { sql, params: [{ name, type }], allowedRoles }`.
-5. The draft is always stored (upsert by `query_name`), even with errors, with `simulated = false` and `expires_at = now + 7 days`. The response returns the status, errors, validated descriptor, the submitted `entry { sql, params }` and `simulated`.
+5. The draft is always stored (upsert by `query_name`), even with errors, with `simulated = false`. Drafts do not expire. The response returns the status, errors, validated descriptor, the submitted `entry { sql, params }` and `simulated`.
 
 **Simulate** (`POST /engine/simulate`)
-1. Loads the draft (`404 DRAFT_NOT_FOUND` if missing or expired). A `DRAFT`-status draft gives `422 DRAFT_INVALID`.
+1. Loads the draft (`404 DRAFT_NOT_FOUND` if missing). A `DRAFT`-status draft gives `422 DRAFT_INVALID`.
 2. Checks the supplied params against the validated list: every declared param must be present and type-compatible, otherwise `400 INVALID_ARGUMENT`.
 3. Executes the SQL template against the projection tables (see "Executor" below). Simulate is capped at 200 rows (`query-engine.simulate.max-rows`).
-4. Saves the draft with `simulated = true` and a fresh 7-day expiry.
+4. Saves the draft with `simulated = true`.
 5. Returns the rows, `rowCount`, `truncated` and `metrics { latencyMs, rowsScanned, planCost }`. Only `latencyMs` is measured. `rowsScanned` is the number of rows returned, and `planCost` is a random placeholder, not a PostgreSQL planner figure. `redactedFields` is always empty.
 
 **Publish** (`POST /engine/publish`, body `{ queryName, allowed_roles }`)
@@ -168,7 +168,7 @@ What the code does today (query-engine `0.0.1-SNAPSHOT`, 2026-10-17). The design
 
 **Discard** (`POST /engine/discard`) loads the draft (`404` if missing) and deletes it. A published version of the same name is untouched.
 
-**List** (`POST /engine/list`) reads every `published_query` row and every unexpired `query_draft` row, merges them by `queryName` in name order, and returns `{ published, draft }` per name (either can be `null`). Filters: `module`, `queryNamePrefix`, `status`, and `author` (matches drafts only). `page.size` defaults to 50 (max 200). `page.cursor` is ignored.
+**List** (`POST /engine/list`) reads every `published_query` row and every `query_draft` row, merges them by `queryName` in name order, and returns `{ published, draft }` per name (either can be `null`). Filters: `module`, `queryNamePrefix`, `status`, and `author` (matches drafts only). `page.size` defaults to 50 (max 200). `page.cursor` is ignored.
 
 **Invoke** (`POST /data-query`, body `{ name, params }`, caller roles in the `X-Roles` header)
 1. A name containing `.` is used as is. A bare name must match exactly one published name by suffix, otherwise `404 QUERY_NOT_FOUND`.
@@ -214,7 +214,7 @@ Each domain service has its own database. It contains the engine's four tables (
 | `errors` | `JSONB` | `[{ "code": "UNDECLARED_PARAM", "param": "branchId", "message": "…" }]`, empty array when valid |
 | `simulated` | `BOOLEAN` | `false` after every draft save, `true` after a successful simulate |
 | `author` | `VARCHAR(255)` | `X-Author` of the last saver; the lock holder |
-| `updated_at`, `expires_at` | `TIMESTAMPTZ` | `expires_at = updated_at + 7 days`, refreshed by draft and simulate |
+| `updated_at` | `TIMESTAMPTZ` | set by draft and simulate. Drafts have no expiry; the old `expires_at` column is dropped on startup |
 
 **`published_query`** (the registry; one live version per query, no history)
 
@@ -235,10 +235,10 @@ Who touches the tables:
 | --- | --- | --- |
 | draft / draft-yml | `query_draft` (lock check) | `query_draft` (upsert) |
 | drafted | `query_draft` | none |
-| simulate | `query_draft`, projection tables | `query_draft` (`simulated`, `updated_at`, `expires_at`) |
+| simulate | `query_draft`, projection tables | `query_draft` (`simulated`, `updated_at`) |
 | publish | `query_draft` | `published_query` (upsert), `query_draft` (delete) |
 | discard | `query_draft` | `query_draft` (delete) |
-| list | `query_draft` (unexpired), `published_query` | none |
+| list | `query_draft`, `published_query` | none |
 | `/data-query` | `published_query`, projection tables | none |
 | `/query-roles` | `realm_role`, `realm_group` | none |
 
@@ -257,7 +257,7 @@ A 50,000-row `order_history_projection` for the streaming demo exists in `order-
 - Nothing restricts what the SQL does. Published SQL runs with the service's full database rights, including writes.
 - Malformed `date` / `datetime` / number strings are rejected at call time as `400 INVALID_ARGUMENT`.
 - Simulate metrics are placeholders (see Simulate above).
-- Expired drafts are hidden at read time. The `sweepExpired` method exists but nothing calls it, so expired rows stay in the table.
+- Drafts never expire. A draft keeps its author's lock until it is published or discarded, so a draft left behind by someone else blocks other authors from drafting that `queryName` until it is discarded (any caller can discard, see below).
 - Caller identity is a stand-in: `X-Author` on `/engine/*` (default `anonymous`) and `X-Roles` on `/data-query` (default `senior_DBA`). There is no authentication.
 - Publishing is not author-checked: any caller can simulate, publish or discard any draft. Only a second `draft` call is blocked by the lock.
 
@@ -269,7 +269,7 @@ A 50,000-row `order_history_projection` for the streaming demo exists in `order-
 | `allowed_roles` declared at draft time; publish takes `{ queryName }` | Publish requires `allowed_roles` (`422 NO_ALLOWED_ROLES` otherwise) |
 | `enum(A, B, ...)` param type | Not implemented; seven types only (table above) |
 | Only the draft's author can simulate, publish or discard; `chief_DBA` can force-discard | Not enforced (see limitations) |
-| Scheduled sweeper with a `DRAFT_EXPIRED` audit entry | Not implemented |
+| Drafts expire after a TTL; a scheduled sweeper deletes them with a `DRAFT_EXPIRED` audit entry | Dropped on purpose: drafts never expire and there is no sweeper |
 | Simulation under a cost limiter with timeout and `EXPLAIN`, plus OPA redaction | Row cap of 200 only; no timeout, `EXPLAIN` or OPA |
 | `list` supports `filter.author = "me"` and `page.cursor` | `"me"` is not special; cursor ignored |
 | Phase 2: JWT, published-query cache and change events, OPA, jOOQ binder, arity, NDJSON streaming, `X-Next-Cursor` / `X-Redacted-Fields` | JWT, cache, OPA, jOOQ binder, arity, `X-Next-Cursor` / `X-Redacted-Fields` are not built. Roles come from `X-Roles`; each call reads the registry. NDJSON streaming with backpressure is built (`Accept: application/x-ndjson`; JSON is capped at 1000 rows with `413`); see `docs/reactive_R2DBC_Cursor-impl.md` |
@@ -316,14 +316,14 @@ Content type is JSON by default across every endpoint. The one exception is draf
 | `errors` | Load-time errors from the last draft call. |
 | `simulated` | `true` once a simulate against this draft has succeeded; reset to `false` on every re-draft. |
 | `author` | The `X-Author` of the last saver. Another author's `draft` call is blocked while the draft is open; simulate, publish and discard are not author-checked yet. |
-| `updatedAt` / `expiresAt` | `expiresAt = updatedAt + draft TTL` (default 7 days, sliding on every draft/simulate call). |
+| `updatedAt` | Set on every draft and simulate call. There is no expiry. |
 
 Rules that follow from this record:
 
 - `simulate`, `publish`, and `discard` always operate on the stored draft for the `queryName` in the body, never on a payload the client sends back.
 - `simulate` is rejected with `422 DRAFT_INVALID` if the draft is `DRAFT` (has validation errors), and with `400 INVALID_ARGUMENT` if a required param is missing or has the wrong type — see "Param validation" below.
 - `publish` is rejected with `422 NOT_SIMULATED` unless the draft has been simulated. Re-drafting resets `simulated` to `false`, so re-drafting after a simulation forces a fresh simulation before publish.
-- A `draft` call from a different author while a draft is open returns `409 DRAFT_LOCKED` (with the holder and `expiresAt`), so two authors can't silently overwrite each other.
+- A `draft` call from a different author while a draft is open returns `409 DRAFT_LOCKED` (with the holder), so two authors can't silently overwrite each other.
 - Drafting a `queryName` that is already published opens a draft that will replace it on publish; the published query keeps serving traffic untouched until then.
 
 ### Param validation
@@ -337,11 +337,11 @@ Two different checks catch bad params, at two different points in the lifecycle:
 
 1. Author writes the query entry — `queryName`, templated `sql`, `params` — through the frontend editor (YAML) or the API. `allowed_roles` are not part of the entry; they are chosen at publish.
 2. Frontend sends the entry, with `queryName: "orders.ordersByStatusAndBranch"`, to `POST /engine/draft`. The engine extracts `:paramName` tokens from `sql` and checks them against `params` — no SQL parsing or column/result-type resolution happens here.
-3. The engine writes the draft record (above) and returns the `ValidatedQuery` descriptor, `status`, `expiresAt`, and any load-time errors (an undeclared or unused parameter). If there are errors the draft is stored as `DRAFT` and the flow stops here until the author re-drafts — nothing executes.
+3. The engine writes the draft record (above) and returns the `ValidatedQuery` descriptor, `status`, and any load-time errors (an undeclared or unused parameter). If there are errors the draft is stored as `DRAFT` and the flow stops here until the author re-drafts — nothing executes.
 4. Frontend renders a simulation form generated from `params` in the response (`status: String`, `branchId: int`, …).
 5. Author fills in sample values; frontend submits `POST /engine/simulate` with `{ queryName, params }`.
 6. The engine loads the stored draft, evaluates the OPA policy for the author's own role (same enforcement point as live traffic) — wrapping `sql` with the row-level predicate described above — then executes it against the projection store under the cost limiter (row cap, timeout, or `EXPLAIN`-only).
-7. The engine marks the draft `simulated: true`, extends `expiresAt`, and returns preview rows, performance metrics (latency, rows scanned, plan cost), and any fields the author's own role would have redacted — so the author sees exactly what a real caller with that role would see.
+7. The engine marks the draft `simulated: true` and returns preview rows, performance metrics (latency, rows scanned, plan cost), and any fields the author's own role would have redacted — so the author sees exactly what a real caller with that role would see.
 8. Author iterates (edit → re-draft → resimulate) as needed.
 9. Author either:
    - clicks **Publish** and picks the realm roles and groups that may invoke the query (from `GET /query-roles`): frontend sends `POST /engine/publish` with `{ queryName, allowed_roles }`. The engine copies the stored `entry` and `validatedQuery` into the published query store with those roles and deletes the draft (there is no published-query-changed event or cache yet); or
@@ -396,10 +396,10 @@ A draft is never callable. `POST /data-query` reads only from the Published Quer
 What the open draft *does* hold is the per-`queryName` lock and storage:
 
 - **Same author comes back** (new tab, browser crash, next day): `POST /engine/drafted` with `{ queryName }` returns the stored entry and the author continues with simulate, publish, or discard. Calling `draft` again also works — it overwrites the draft in place.
-- **Different author** tries to draft the same `queryName`: gets `409 DRAFT_LOCKED` with the holder and `expiresAt`. A user with the `chief_DBA` role can force-discard the draft.
-- **Nobody comes back**: a scheduled sweeper deletes drafts past `expiresAt` (default 7 days idle) and writes a `DRAFT_EXPIRED` audit entry. This releases the lock. Any later `simulate`/`publish`/`discard` call gets `404 DRAFT_NOT_FOUND`, and the author must draft again — this is the drafted-vs-non-drafted distinction `/engine/drafted` exists to surface.
+- **Different author** tries to draft the same `queryName`: gets `409 DRAFT_LOCKED` with the holder. A user with the `chief_DBA` role can force-discard the draft.
+- **Nobody comes back**: nothing happens. Drafts do not expire, so the draft and its lock stay until someone publishes or discards it (an earlier design had a 7-day TTL and a sweeper; both were removed). `discard` releases the lock.
 
-`discard` is therefore a courtesy that releases the lock and storage straight away. It isn't needed for correctness; TTL expiry has the same final effect.
+`discard` is the only way to release a draft that will not be published, since there is no expiry.
 
 ### Example JSON
 
@@ -428,7 +428,6 @@ Response (`200`):
     "allowedRoles": []
   },
   "errors": [],
-  "expiresAt": "2026-10-14T10:02:00Z",
   "entry": {
     "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
     "params": { "status": "String", "branchId": "int" }
@@ -449,7 +448,6 @@ Response with a param validation error (`200`, draft stored as `DRAFT`):
   "errors": [
     { "code": "UNDECLARED_PARAM", "param": "branchId", "message": ":branchId is used in sql but missing from params" }
   ],
-  "expiresAt": "2026-10-14T09:58:00Z",
   "entry": {
     "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
     "params": { "status": "String" }
@@ -488,8 +486,7 @@ Response (`200`):
   "rowCount": 1,
   "truncated": false,
   "metrics": { "latencyMs": 18, "rowsScanned": 340, "planCost": 12.4 },
-  "redactedFields": [],
-  "expiresAt": "2026-10-14T10:05:00Z"
+  "redactedFields": []
 }
 ```
 
@@ -602,8 +599,7 @@ Response (`200`):
         "status": "VALIDATED",
         "simulated": true,
         "author": "anirudhya.sarker@bracits.com",
-        "updatedAt": "2026-10-08T09:12:00Z",
-        "expiresAt": "2026-10-15T09:12:00Z"
+        "updatedAt": "2026-10-08T09:12:00Z"
       }
     }
   ],
@@ -618,7 +614,7 @@ Error responses share one shape across all `/engine` endpoints:
 ```json
 {
   "error": "DRAFT_LOCKED",
-  "message": "Draft for 'orders.ordersByStatusAndBranch' is held by anirudhya.sarker@bracits.com (expires 2026-10-15T09:12:00Z)",
+  "message": "Draft for 'orders.ordersByStatusAndBranch' is held by anirudhya.sarker@bracits.com. It stays locked until they publish or discard it.",
   "queryName": "orders.ordersByStatusAndBranch"
 }
 ```
@@ -627,7 +623,7 @@ Error responses share one shape across all `/engine` endpoints:
 | --- | --- | --- |
 | `INVALID_QUERY_NAME` | 400 | `queryName` missing from the body or not in `{module}.{name}` form |
 | `INVALID_ARGUMENT` | 400 | A param required by the validated query is missing from `params`, or has the wrong type |
-| `DRAFT_NOT_FOUND` | 404 | No open draft for `queryName` (never drafted, published, discarded, or expired) — the non-drafted case |
+| `DRAFT_NOT_FOUND` | 404 | No open draft for `queryName` (never drafted, published, or discarded) — the non-drafted case |
 | `DRAFT_LOCKED` | 409 | Another author holds the open draft for `queryName` |
 | `DRAFT_INVALID` | 422 | Simulate on a draft with validation/param-declaration errors |
 | `NOT_SIMULATED` | 422 | Publish before the draft has been simulated |

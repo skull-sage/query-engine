@@ -367,8 +367,12 @@ Numbers in angle brackets are starting points to be confirmed by the spike.
   bean, so Boot's auto-configuration is untouched.
 - U8 (browser/proxy read-ahead): measured with a Node consumer through the Vite proxy (`localhost:5173`), 100 rows then 100 ms:
   ordered, no gaps, same read-ahead bound as above. A real browser was not used, so browser fetch internals are unverified.
-- U9 (`statement_timeout`): passed as a connection option through `ProjectionDatabase`; not exercised by a test that makes a
-  statement exceed the timeout.
+- U9 (`statement_timeout`): passed as a connection option through `ProjectionDatabase`. Later finding (2026-10-19): Postgres
+  applies it to the whole cursor read, not to each fetch, so every stream longer than the timeout (60 s default) is cancelled
+  with `QUERY_TIMEOUT`, even when the client is healthy but slow. A 100,000-row run at 1,000 rows/s hit it at about 62 s. The
+  4.5 table listing 60 s as a stream guard is therefore wrong for streams; it needs a separate decision (see PROGRESS.md, open
+  issue 1). The service also hides this from browsers when they connect through the Vite dev proxy, which does not
+  propagate an upstream abort.
 
 Other results: pool saturation (25 slow readers against a pool of 20) gives `503 SERVICE_BUSY` with `Retry-After: 2` while
 `/engine/list` stays fast (46 ms). The JSON cap gives `413 RESULT_TOO_LARGE`. Simulate on the 100,000-row query returns in
@@ -695,3 +699,112 @@ live order-query stack (run on click, 50,000 rows delivered, charts and availabi
 a hidden tab, a machine without Docker, or non-Chromium browsers. One observation worth knowing when reading the charts: with
 no container memory limit the service's memory sits at roughly 460 MiB during a run (the JVM grows its heap), so the memory
 chart is flat but not small; use the low-memory override (`docker-compose.lowmem.yml`) to see it against a real limit.
+
+## 12. Read-only queries: only SELECT may be drafted or run (plan, not built)
+
+Status: planned 2026-10-19, nothing implemented. Written so the work can be picked up later. It is separate from backpressure
+but touches the same files (`QueryValidator`, `ProjectionDatabase`, `ProjectionStoreExecutor`).
+
+### 12.1 The gap
+
+- `QueryValidator` does not parse SQL. It scans `:name` tokens and cross-checks them against `params`. A drafted
+  `DELETE FROM order_projection` therefore gets status `VALIDATED`.
+- Simulate executes the SQL for real, so such a draft would run at simulate time. (Read from the code, not tried.)
+- Published queries run the same way on `/data-query`.
+- The projection pool uses the service's own database user (`ProjectionDatabase` falls back to `spring.r2dbc.*`). In the dev
+  containers that user is the Postgres superuser, so a query can also read or change the engine's own tables
+  (`query_draft`, `published_query`) and call superuser-only functions.
+
+### 12.2 Approach: defense in depth
+
+A SQL checker alone can be bypassed, so the database is the real guarantee and the validator gives authors fast, clear errors.
+
+**Layer 1: the database enforces it (do first)**
+
+1. A SELECT-only Postgres role per domain (for example `order_query_ro`, `inventory_query_ro`): `SELECT` on the projection tables
+   only, nothing on the engine tables, and `ALTER ROLE ... SET default_transaction_read_only = on`.
+2. The projection pool uses it through the existing `query-engine.projection.username` / `password` properties. The main pool
+   (drafts, published queries, roles catalog) keeps its own user.
+3. `ProjectionDatabase` also adds `default_transaction_read_only=on` to the connection `options` it already sets for
+   `statement_timeout`. It is applied once per pooled connection, so there is no per-query cost, and cursors / `fetchSize`
+   work inside a read-only transaction.
+4. Map SQLSTATE `25006` (read-only transaction) and `42501` (insufficient privilege) in `ProjectionStoreExecutor.translate` to a
+   new kind that becomes `QUERY_NOT_READ_ONLY` (403). Log it at ERROR with the query name. Simulate shows the database's
+   message; `/data-query` shows only the code.
+5. Rollout notes: dev stacks pick the role up from the init scripts after `./stop.sh` (the init scripts run only on a new
+   volume); existing databases get a SQL file to run by hand. In production a DBA creates the role and the password comes from
+   the secret store, never the repo. Without a separate role only the read-only setting remains, which a
+   `set_config('default_transaction_read_only', 'off', false)` call could flip for the pooled session, so the function list in
+   Layer 2 then becomes the main guard.
+
+**Layer 2: draft-time check (fast feedback)**
+
+A small SQL lexer in `query-engine/.../validation`, no new dependency. It strips comments (including nested `/* /* */ */`),
+string literals (including `E'..'` escapes), quoted identifiers and dollar-quoted blocks, then applies:
+
+| Rule | Error code |
+| --- | --- |
+| More than one statement (a single trailing `;` is fine) | `MULTIPLE_STATEMENTS` |
+| First token is not `SELECT`, `WITH` or `(` | `NOT_A_SELECT` |
+| `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `TRUNCATE`, `CREATE`, `ALTER`, `DROP`, `GRANT`, `REVOKE`, `COPY`, `CALL`, `DO`, `SET`, `RESET`, `LOCK`, `VACUUM`, `ANALYZE`, `REINDEX`, `CLUSTER`, `COMMENT`, `REFRESH`, `LISTEN`, `NOTIFY`, `PREPARE`, `EXECUTE`, `DISCARD` anywhere outside literals and quoted names (this also catches `WITH d AS (DELETE ... RETURNING ...)`) | `WRITE_KEYWORD` |
+| `INTO` after `SELECT` | `SELECT_INTO` |
+| `FOR UPDATE`, `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE` | `LOCKING_CLAUSE` |
+| Calls to `set_config`, `nextval`, `setval`, `pg_sleep*`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_read_file`, `pg_read_binary_file`, `pg_ls_*`, `lo_*`, `dblink*`, `pg_advisory_*`, `pg_reload_conf`, `pg_rotate_logfile` (matched on the last name segment, so `pg_catalog.x` is covered) | `FORBIDDEN_FUNCTION` |
+
+- Errors go into the existing validation errors. The draft is stored as `DRAFT`, so simulate and publish already refuse it
+  with `422 DRAFT_INVALID`; no new lifecycle state is needed. Messages name the keyword and its line, for example
+  `DELETE is not allowed: queries must be read-only (line 3)`.
+- The lexer also replaces the regex `:name` scan, so `::text` casts and colons inside string literals stop being read as
+  parameters (a known limitation listed in the PRD). This is a deliberate by-product.
+- The function list is best effort. Layer 1 is what actually enforces the rule.
+- Chosen over a full SQL parser (JSqlParser) because it does not parse grammar, so it cannot reject a valid but unusual
+  SELECT. The cost: a column literally named `delete`, `merge` and so on must be quoted.
+
+**Layer 3: existing data and the execute path**
+
+- Re-run the check at publish, covering drafts saved before this change.
+- A startup audit scans `query_draft` and `published_query` and logs each query that fails the check. A failing published query
+  is stopped at run time by Layer 1 (`QUERY_NOT_READ_ONLY`).
+- UI: `DraftStep` gets the hint "Only SELECT, or WITH ... SELECT, is allowed." Validation errors already render in the draft step.
+
+### 12.3 Keeping the engine fast
+
+- Parsing happens only at draft and publish. The `/data-query` path gets no extra work.
+- Read-only is a connection setting, not a per-query step.
+- Record a baseline before starting and compare afterwards: the 100K-row pull time, memory with 6 concurrent pulls, and the
+  pool-saturation `503` behaviour. They should match within noise.
+
+### 12.4 Implementation phases
+
+| Phase | Work | Exit criteria |
+| --- | --- | --- |
+| R0. Baseline | Record the numbers in 12.3 on the current build | Numbers noted in this doc |
+| R1. Database layer | Read-only roles in both domains' init scripts and compose files, `default_transaction_read_only` option, SQLSTATE mapping, SQL file for existing databases | AC-R5, AC-R6 |
+| R2. Draft-time check | Lexer, validator integration, `:name` extraction moved onto the lexer, unit tests, `DraftStep` hint | AC-R1 to AC-R4, AC-R8 |
+| R3. Existing data | Re-check at publish, startup audit | AC-R7 |
+| R4. Verify and document | Re-run baseline, update the PRD limitations ("Nothing restricts what the SQL does"), this section and `PROGRESS.md` | AC-R9 |
+
+### 12.5 Acceptance criteria
+
+| ID | Scenario | Pass condition |
+| --- | --- | --- |
+| AC-R1 | Draft each of `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `DROP`, `TRUNCATE`, `ALTER`, `GRANT`, `COPY`, `CALL`, `DO`, `MERGE` | Status `DRAFT`, the specific error code, nothing executed; simulate and publish refuse with `422 DRAFT_INVALID` |
+| AC-R2 | `SELECT 1; DROP TABLE x`, `WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d`, `SELECT * INTO n FROM t`, `SELECT ... FOR UPDATE`, `SELECT nextval('s')`, `SELECT set_config(...)` | `MULTIPLE_STATEMENTS`, `WRITE_KEYWORD`, `SELECT_INTO`, `LOCKING_CLAUSE`, `FORBIDDEN_FUNCTION`, `FORBIDDEN_FUNCTION` |
+| AC-R3 | Must still pass: column `updated_at`, `'DELETE'` in a string, `-- update` in a comment, `"update"` quoted, `x::text`, `'a:b'`, a trailing `;`, nested comments, a dollar-quoted string | Draft is `VALIDATED`; only real `:name` tokens count as params |
+| AC-R4 | All existing sample queries and the demo query `orders.historyByDate` | Draft, simulate and publish as before |
+| AC-R5 | Run INSERT / DELETE / DDL directly as the read-only role | Rejected by Postgres (`25006` or `42501`) |
+| AC-R6 | As the read-only role: read `query_draft`; call `set_config` then write; call `pg_read_file` | Permission denied; writes still fail |
+| AC-R7 | A stored query that fails the check (inserted by hand) | Startup audit logs it; running it returns `QUERY_NOT_READ_ONLY`; the service keeps serving other queries |
+| AC-R8 | UI | The draft step shows the error list and the SELECT-only hint |
+| AC-R9 | Performance | 100K pull time, memory and saturation behaviour match the R0 baseline within noise |
+
+### 12.6 Decisions still open
+
+1. Lexer or a real SQL parser. Recommended: lexer.
+2. Whether a separate read-only role per domain can be added (needs an infrastructure change in production). Without it the
+   function list is the main guard.
+3. A stored query that fails the check: block it (recommended) or only log it.
+4. A table allowlist (reject `query_draft`, `pg_catalog` and similar at draft time) needs a real parser; left out because the
+   role's grants already cover it.
+5. Related, from the 77.8% halt: how `statement_timeout` should apply to streams (see `PROGRESS.md`, open issue 1). It is in
+   the same file (`ProjectionDatabase`) and best decided together.

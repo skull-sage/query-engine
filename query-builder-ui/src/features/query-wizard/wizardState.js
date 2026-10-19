@@ -113,13 +113,13 @@ export function wizardReducer(state, action) {
         ...state,
         simulateBusy: false,
         simulation: { revision: state.revision, result: action.result },
-        draft: state.draft ? { ...state.draft, simulated: true, expiresAt: action.result.expiresAt ?? state.draft.expiresAt } : state.draft,
+        draft: state.draft ? { ...state.draft, simulated: true } : state.draft,
       }
 
     case 'SIMULATE_FAILURE':
       return { ...state, simulateBusy: false, simulateError: action.error }
 
-    // The draft no longer exists on the server (expired, discarded or published elsewhere).
+    // The draft no longer exists on the server (discarded or published elsewhere).
     // Keep the editor text, require a save to re-create it, and send the user back to Draft.
     case 'DRAFT_GONE':
       return {

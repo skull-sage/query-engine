@@ -260,8 +260,6 @@ function QueryRow({ item, onAction }) {
             <span title={formatDateTime(draft.updatedAt)}>
               saved {formatRelative(draft.updatedAt)} by {draft.author}
             </span>
-            <span aria-hidden="true">·</span>
-            <span title={formatDateTime(draft.expiresAt)}>expires {formatRelative(draft.expiresAt)}</span>
             {heldByOther && <span className="rounded bg-amber-50 px-1.5 py-0.5 text-amber-800 ring-1 ring-amber-200">held by {draft.author}</span>}
           </div>
         )}
@@ -322,7 +320,7 @@ function EmptyState({ tab, search, domain, onNew }) {
     body = 'Try a different name, or clear the search.'
   } else if (tab === 'draft') {
     title = 'No open drafts'
-    body = 'Drafts appear here once saved, until they are published, discarded or expire.'
+    body = 'Drafts appear here once saved, until they are published or discarded.'
   } else if (tab === 'published') {
     title = 'Nothing published yet'
     body = `Published ${domain.label} queries are what client apps can call.`

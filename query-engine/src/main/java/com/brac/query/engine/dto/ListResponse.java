@@ -24,8 +24,7 @@ public record ListResponse(List<Item> items, String nextCursor) {
             String status,
             boolean simulated,
             String author,
-            Instant updatedAt,
-            Instant expiresAt
+            Instant updatedAt
     ) {
     }
 }

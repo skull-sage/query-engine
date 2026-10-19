@@ -10,8 +10,7 @@ public record SimulateResponse(
         int rowCount,
         boolean truncated,
         Metrics metrics,
-        List<String> redactedFields,
-        Instant expiresAt
+        List<String> redactedFields
 ) {
     public record Metrics(long latencyMs, long rowsScanned, double planCost) {
     }

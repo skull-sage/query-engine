@@ -123,24 +123,25 @@ the findings do not depend on the row count). Full detail is in `docs/reactive_R
 - Not verified: a statement hitting `statement_timeout`; a Postgres error before the first row under NDJSON; a real browser.
 
 ### Open issues
-1. **Reported halt at 77.8% (open, cause unknown).** A run over the 100,000-row dataset in the Downstream demo stopped at
-   77.8% and the page received no more data. Not yet diagnosed; nothing was captured from the service at the time.
-   It may be the same thing as the one unexplained stall seen during the spike (first full pull after a container
-   recreate, cut at 14,192 rows by the 30 s stall guard). Whether it is related is not established.
-   - What to capture the next time it happens, right after the halt:
-     - `docker logs order-query-app 2>&1 | grep "data-query query" | tail -3`. The `outcome=` and `reason=` fields say who
-       ended the stream: `reason=STREAM_STALLED` means the page stopped reading for 30 s and the server cut it off on purpose
-       (a frozen, hidden or sleeping tab would cause that; not confirmed); `outcome=error` means a database or pool failure;
-       `outcome=cancelled` means the browser or proxy dropped the connection; `outcome=completed` means the server finished and
-       the page lost the tail.
-     - The browser console and the Network tab entry for `/data-query` (state, size, error).
-     - `docker stats order-query-app order-query-postgres` and the `pg_stat_activity` query shown on the demo page.
-     - The Resource usage panel's "Copy CSV" for the run (CPU, memory, event-loop lag, rows per second, tab hidden marks).
-   - Logging that would make this diagnosable without reproducing it (proposed, not built):
-     - a progress line for long streams every 10 s (rows, elapsed, rows/s) so a stall shows as a flat counter;
-     - log the last-row time and the demand state when the stall guard fires;
-     - log the moment a stream is cancelled and which side closed it, if the server can tell;
-     - suppress the noisy `UnsupportedOperationException` when an error occurs after the response is committed.
+1. **Halt at 77.8%: cause found (2026-10-19), fix not yet made.** Reproduced with the 100,000-row dataset at the demo's pace
+   (100 rows per 100 ms): the page stopped at 77,000 rows and stayed on "Streaming" with no error. Two separate causes:
+   - **Root cause: `statement_timeout`.** The projection connections set `statement_timeout = 60s`
+     (`query-engine.stream.statement-timeout`). Postgres counts it across the whole cursor read, not per fetch, so any stream
+     that stays open for more than 60 s is cancelled (`canceling statement due to statement timeout` in the Postgres log;
+     `outcome=timeout reason=QUERY_TIMEOUT durationMs=61834` in the service log). At 1,000 rows/s the consumer was at about
+     62K rows when it fired, and it then drained the roughly 15K rows already buffered, which is why it stopped near 77%.
+     The 50K runs finish in about 50 s, under the limit, which is why they passed. Proof: the same 100K run with the
+     timeout raised to 5 minutes delivered all 100,000 rows in order (Finished at 1:41, `outcome=completed`).
+   - **Second defect: the Vite proxy hides the abort.** When the service aborts a stream mid-way, curl straight to the service
+     exits 18 (incomplete transfer), but the same call through the dev-server proxy (`/api/order/...`) keeps the connection open
+     and delivers nothing more until the client's own timeout. The page therefore never sees an error. Reproduced with a 10 s
+     timeout: direct curl exit 18 after 21.7 s, proxied curl exit 28 (client timeout) at 40 s, same row count both times.
+   - Proposed fixes (not made): (a) stop using `statement_timeout` as the stream limit; it was meant to bound runaway queries
+     but it also caps slow consumers, and `max-duration` (10 min) and the stall guard already bound a stream. Options: raise it
+     above `max-duration`, apply it only to JSON/simulate, or time the first row only. (b) make the proxy close the browser
+     connection when the upstream aborts (`proxyRes.on('aborted', () => res.destroy())` in `vite.config.js`). (c) a
+     client-side watchdog in the page that fails the run when no bytes arrive for a while.
+   - Why it was not seen earlier: the spike's longest stream was under 60 s.
 2. Noisy ERROR log when an error happens after the response is committed (harmless, see above).
 3. One unexplained stall in a first run after a container recreate (not reproduced in about 20 runs).
 4. The Downstream demo page has been checked with a Node consumer and a production build, not by hand in a browser (see the
@@ -165,8 +166,26 @@ the findings do not depend on the row count). Full detail is in `docs/reactive_R
 - Not built: Spring Boot Actuator metrics in the services (JVM heap, GC, process CPU). Left out because it opens an
   unauthenticated endpoint; it is listed in section 11 as an option.
 
+## Drafts no longer expire (2026-10-19)
+- Removed the 7-day draft TTL: no `expires_at`, no `expiresAt` in the draft, simulate and list responses, no expiry check
+  on lookups or on the lock. A draft stays until it is published or discarded. Startup drops the old `expires_at` column.
+- Consequence: another author's draft keeps its `409 DRAFT_LOCKED` until it is published or discarded. Any caller can
+  discard today (no author check), so a forgotten draft is released by discarding it.
+- Verified live on order-query: draft, lock (409 with the new message), simulate, list, a draft backdated 60 days still found
+  and publishable, and the old column dropped on restart. UI list and wizard no longer show "expires".
+
+## Planned: SELECT-only queries (not built)
+Today the validator does not parse SQL, so a drafted `DELETE` / `UPDATE` / `CREATE` is accepted and simulate would run it
+(the projection pool uses the service's own database user, a superuser in the dev containers). The plan, in three layers
+(a read-only database role plus a read-only session on the projection pool; a draft-time SQL lexer with specific error codes;
+re-check at publish and a startup audit of stored queries), with phases R0 to R4, acceptance criteria AC-R1 to AC-R9 and the
+open decisions, is in `docs/reactive_R2DBC_Cursor-impl.md`, section 12. First step when resuming: record the performance
+baseline (R0), then the database layer (R1).
+
 ## Possible next steps
 
+- Fix the 77.8% halt (open issue 1: `statement_timeout` on streams, the dev proxy hiding aborts, a page-side watchdog).
+- Read-only queries (section 12 of the impl doc).
 - Open the Downstream demo page in a browser and watch memory and the Postgres connection while it runs.
 - Quiet the post-commit error logging and investigate the one unexplained stream stall.
 - Auth is still a stand-in: `X-Author` and `X-Roles` headers. `/data-query` defaults to `senior_DBA` without `X-Roles`.
