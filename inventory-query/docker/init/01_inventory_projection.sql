@@ -13,6 +13,9 @@
 --
 -- snake_case column names are used so they need no quoting in query templates.
 
+-- Seeded as the administrator (docker-entrypoint-initdb.d), before the database logins exist; `./gradlew provision`
+-- then lets the service login use and write these tables.
+
 CREATE TABLE IF NOT EXISTS inventory_projection (
     sku               VARCHAR(32)    NOT NULL,
     warehouse_id      VARCHAR(16)    NOT NULL,

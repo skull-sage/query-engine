@@ -1,0 +1,40 @@
+spring:
+  application:
+    name: order-query
+  # Order domain projection store. query-engine creates its own tables (drafts, published queries,
+  # identity catalog) in this same database, in the query_engine schema, on startup; the projection tables
+  # are seeded by docker/init. Defaults target the dockerized Postgres from docker/docker-compose.yml (host
+  # port 5433), so `./gradlew :order-query:bootRun` works once the database container is up and provisioned.
+  r2dbc:
+    url: "${R2DBC_URL:r2dbc:postgresql://localhost:5433/order_query}"
+    username: "${DB_USERNAME:order_query}"
+    password: "${DB_PASSWORD:order_query}"
+    pool:
+      enabled: true
+      initial-size: "${R2DBC_POOL_INITIAL_SIZE:5}"
+      max-size: "${R2DBC_POOL_MAX_SIZE:20}"
+      max-idle-time: "${R2DBC_POOL_MAX_IDLE_TIME:30m}"
+
+server:
+  port: "${SERVER_PORT:8081}"
+
+# query-engine opens two more connection pools of its own, each logging in as a different database user,
+# so no single login can both run authors' queries and change the engine's tables
+# (docs/security_protocol.md). These settings are the only place those logins are defined: `./gradlew
+# provision` reads them, together with spring.r2dbc above and the database name in its url, to create the
+# logins and permissions, and the running service reads them to connect. Without them both pools fall back
+# to spring.r2dbc.*, and the startup check refuses that.
+query-engine:
+  # The engine's own tables in the query_engine schema (drafts, published queries, roles).
+  store:
+    username: "${QE_STORE_USERNAME:query_engine_owner}"
+    password: "${QE_STORE_PASSWORD:qe_owner}"
+  # Authors' queries; this login can read data and nothing else.
+  projection:
+    username: "${QE_PROJECTION_USERNAME:query_engine_ro}"
+    password: "${QE_PROJECTION_PASSWORD:qe_ro}"
+  # Used by `./gradlew provision` only (the administrator login is supplied at that moment, never here).
+  provision:
+    # Schemas that hold this domain's projection tables. The reader finds unqualified table names here and
+    # the service login may write them.
+    projection-schemas: public

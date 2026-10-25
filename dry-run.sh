@@ -4,16 +4,21 @@
 # either in the browser or through each service's http/*.http files.
 #
 #   Domain     Service           Service URL             Postgres (host port)
-#   order      order-query       http://localhost:8081   localhost:5433  db/user/pass = order_query
-#   inventory  inventory-query   http://localhost:8082   localhost:5434  db/user/pass = inventory_query
+#   order      order-query       http://localhost:8081   localhost:5433  db order_query, admin login postgres/postgres
+#   inventory  inventory-query   http://localhost:8082   localhost:5434  db inventory_query, admin login postgres/postgres
 #   UI         query-builder-ui  http://localhost:5173
+#
+# Each database also gets three application logins, created by `./gradlew provision` in the service from its
+# application.yml (see docs/security_protocol.md): the service's own (order_query / inventory_query),
+# query_engine_owner for the engine's tables, and query_engine_ro, which runs authors' queries and can only read.
 #
 # Steps:
 #   1. Publish query-engine to the local Maven repository, then build each selected service's
 #      boot jar. Each project is an independent Gradle build; services depend on the published
 #      com.brac.query:query-engine artifact.
-#   2. For each selected domain, start its own docker compose stack (its Postgres, seeded with
-#      that domain's projection data, then the service container) and wait until it answers.
+#   2. For each selected domain, start its Postgres (seeded with that domain's projection data), run
+#      `./gradlew provision` in the service to create the database logins and permissions from its
+#      application.yml, then start the service container and wait until it answers.
 #   3. Start the Query Builder UI (Vite dev server) and open it in the browser.
 #
 # Each service runs in its own container so you can check it holds no in-memory state: with
@@ -103,15 +108,9 @@ fi
 for domain in ${DOMAINS}; do
   echo "==> [${domain}] Starting Postgres (seeded with ${domain} projection data) ..."
   compose "${domain}" up -d --wait postgres
-  echo "    -> localhost:$(db_port_of "${domain}") (db/user/pass = $(service_of "${domain}" | tr - _))"
+  echo "    -> localhost:$(db_port_of "${domain}") (db $(service_of "${domain}" | tr - _), admin login postgres/postgres)"
 done
 
-if [[ "${DB_ONLY}" -eq 1 ]]; then
-  echo "==> --db-only set: skipping services and UI."
-  exit 0
-fi
-
-# ---- 2. publish query-engine locally, then build each selected service ----
 # Each project is an independent Gradle build. query-engine is published to the local Maven
 # repository (~/.m2) and each service resolves it from there as com.brac.query:query-engine.
 # Always run the builds: Gradle's up-to-date checks make them no-ops when nothing changed, and
@@ -127,11 +126,35 @@ gradle_build() {
   fi
 }
 
-echo "==> Publishing query-engine to the local Maven repository ..."
-gradle_build query-engine publishToMavenLocal
+publish_engine() {
+  echo "==> Publishing query-engine to the local Maven repository ..."
+  gradle_build query-engine publishToMavenLocal
+}
+
+# Creates the database logins and permissions from the service's own application.yml (the service
+# login, the login that owns the engine's tables, the read-only login for authors' queries), as the
+# administrator the compose file sets up. Safe to run again.
+provision_domain() {
+  echo "==> [$1] Provisioning database logins from $(service_of "$1")/src/main/resources/application.yml ..."
+  gradle_build "$(service_of "$1")" provision
+}
+
+if [[ "${DB_ONLY}" -eq 1 ]]; then
+  # Provision too, so `./gradlew bootRun` in a service works against just the database container.
+  publish_engine
+  for domain in ${DOMAINS}; do
+    provision_domain "${domain}"
+  done
+  echo "==> --db-only set: skipping services and UI."
+  exit 0
+fi
+
+# ---- 2. publish query-engine locally, build each selected service, set up its database logins ----
+publish_engine
 for domain in ${DOMAINS}; do
   echo "==> Building $(service_of "${domain}") ..."
   gradle_build "$(service_of "${domain}")" bootJar
+  provision_domain "${domain}"
 done
 
 # ---- 3. build and start each service container, then wait for it ----

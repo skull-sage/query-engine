@@ -10,6 +10,8 @@ import { useLeaveGuard } from '../../context/LeaveGuard.jsx'
 import { useAbortableRequests } from '../../hooks/useAbortableRequests.js'
 import { entryToYaml, paramListToMap, peekQueryName, yamlToDraftEntry } from '../../api/yaml.js'
 import { AUTHOR } from '../../config.js'
+import { useDefinitionChecks } from '../../sql/useDefinitionChecks.js'
+import { problemCount } from './DefinitionProblems.jsx'
 import { STEPS, deriveWizard, initialWizardState, resolveResumeStep, wizardReducer } from './wizardState.js'
 import DraftStep from './DraftStep.jsx'
 import SimulateStep from './SimulateStep.jsx'
@@ -45,6 +47,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
     initialWizardState({ yamlText: resuming ? '' : domain.sampleDraft, resuming }),
   )
   const derived = deriveWizard(state)
+  const definition = useDefinitionChecks(state.yamlText) // live check of the editor text; the server re-checks on save
   const [confirm, setConfirm] = useState(null) // 'close' | 'discard' | null
   const [resumeAttempt, setResumeAttempt] = useState(0)
 
@@ -199,7 +202,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
             </Button>
           ) : null
         }
-        footer={ready ? <Footer state={state} derived={derived} actions={{ saveDraft, publish, requestClose, onClose, onRun, goto: (step) => dispatch({ type: 'GOTO', step }) }} /> : (
+        footer={ready ? <Footer state={state} derived={derived} definition={definition} actions={{ saveDraft, publish, requestClose, onClose, onRun, goto: (step) => dispatch({ type: 'GOTO', step }) }} /> : (
           <Button variant="secondary" onClick={onClose}>Close</Button>
         )}
       >
@@ -235,6 +238,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
                 <DraftStep
                   state={state}
                   derived={derived}
+                  definition={definition}
                   nameWarning={nameWarning}
                   onYamlChange={(yamlText) => dispatch({ type: 'EDIT_YAML', yamlText })}
                 />
@@ -272,7 +276,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
   )
 }
 
-function Footer({ state, derived, actions }) {
+function Footer({ state, derived, definition, actions }) {
   const { step, draft, published } = state
 
   if (published) {
@@ -290,8 +294,21 @@ function Footer({ state, derived, actions }) {
 
   if (step === 'draft') {
     const nothingToSave = !!draft && !derived.dirty
+    // Say plainly why the flow can't go on, so a disabled button is never the only signal.
+    const savedInvalid = !!draft && !derived.dirty && draft.status === 'DRAFT'
+    const liveProblems = !savedInvalid && derived.dirty ? definition?.problems.length ?? 0 : 0
+    const invalidNote = savedInvalid
+      ? 'The saved draft is invalid. Fix the problems above and save again to continue.'
+      : liveProblems > 0
+        ? `${problemCount(liveProblems)} in the definition. You can save it, but it stays an invalid draft.`
+        : null
     return (
       <>
+        {invalidNote && (
+          <span role="status" className="mr-auto text-xs font-medium text-rose-700">
+            {invalidNote}
+          </span>
+        )}
         <Button variant="secondary" onClick={actions.requestClose}>
           Cancel
         </Button>

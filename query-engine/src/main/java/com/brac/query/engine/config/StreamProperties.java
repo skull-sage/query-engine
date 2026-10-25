@@ -8,7 +8,7 @@ import java.time.Duration;
 /**
  * Tuning for streaming {@code /data-query} results from Postgres (see
  * docs/reactive_R2DBC_Cursor-impl.md). All values can be overridden in the consuming service's
- * {@code application.properties} under {@code query-engine.stream.*}.
+ * {@code application.yml} under {@code query-engine.stream.*}.
  *
  * @param fetchSize        rows per database round trip when a query does not set its own
  * @param maxFetchSize     largest {@code fetchSize} an author may set on a query

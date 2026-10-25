@@ -17,15 +17,15 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Query Registry backed by the {@code published_query} table in Postgres, accessed reactively via
- * {@link DatabaseClient} (R2DBC). At most one published entry per queryName; publishing again
+ * Query Registry backed by the {@code query_engine.published_query} table in Postgres, accessed
+ * reactively via {@link DatabaseClient} (R2DBC) on the engine's own pool ({@link EngineDatabase}). At most one published entry per queryName; publishing again
  * overwrites the row via upsert. No versioning.
  */
 @Component
 public class PublishedQueryRepository {
 
     private static final String UPSERT = """
-            INSERT INTO published_query
+            INSERT INTO query_engine.published_query
                 (query_name, sql_text, params, allowed_roles, fetch_size, validated_query,
                  published_at, published_by)
             VALUES
@@ -44,13 +44,13 @@ public class PublishedQueryRepository {
     private final DatabaseClient db;
     private final JsonbSupport jsonb;
 
-    public PublishedQueryRepository(DatabaseClient db, JsonbSupport jsonb) {
-        this.db = db;
+    public PublishedQueryRepository(EngineDatabase engine, JsonbSupport jsonb) {
+        this.db = engine.client();
         this.jsonb = jsonb;
     }
 
     public Mono<PublishedQuery> find(String queryName) {
-        return db.sql("SELECT * FROM published_query WHERE query_name = :queryName")
+        return db.sql("SELECT * FROM query_engine.published_query WHERE query_name = :queryName")
                 .bind("queryName", queryName)
                 .map((row, meta) -> toPublishedQuery(row))
                 .one();
@@ -74,13 +74,13 @@ public class PublishedQueryRepository {
     }
 
     public Flux<PublishedQuery> findAll() {
-        return db.sql("SELECT * FROM published_query")
+        return db.sql("SELECT * FROM query_engine.published_query")
                 .map((row, meta) -> toPublishedQuery(row))
                 .all();
     }
 
     public Flux<String> allQueryNames() {
-        return db.sql("SELECT query_name FROM published_query")
+        return db.sql("SELECT query_name FROM query_engine.published_query")
                 .map((row, meta) -> row.get("query_name", String.class))
                 .all();
     }

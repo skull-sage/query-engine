@@ -1,7 +1,8 @@
 # Query Engine — Progress / Resume Notes
 
-Last updated: 2026-10-18. Snapshot of what's been built so we can pick up later. The `/data-query` backpressure work is
-implemented; see "Backpressure for /data-query".
+Last updated: 2026-10-25. Snapshot of what's been built so we can pick up later. The `/data-query` backpressure work is
+implemented; see "Backpressure for /data-query". The security protocol (separate schema and logins, read-only queries,
+SQL lexer) is built; see "Security protocol".
 
 ## Architecture
 
@@ -21,10 +22,13 @@ abstraction; each domain has its own query service that embeds it and owns its o
   resolves it from `mavenLocal()` (restricted to the `com.brac.query` group).
 - **query-engine wires itself in** via `QueryEngineAutoConfiguration` (registered in
   `META-INF/spring/...AutoConfiguration.imports`): its controllers (`/engine/*`, `/data-query`, `/query-roles`), service,
-  stores and error handling. A service only supplies `spring.r2dbc.*` and its projection tables.
-- **query-engine owns its tables.** `query-engine/src/main/resources/query-engine/schema.sql` (drafts, published queries,
-  realm roles/groups catalog) runs on every service startup; all statements are idempotent. Disable with
-  `query-engine.schema.initialize=false`. Each domain's projection tables are seeded by its own `docker/init`.
+  stores and error handling. A service supplies `spring.r2dbc.*` and its projection tables; the engine opens two more pools
+  (`query-engine.store.*` for its tables, `query-engine.projection.*` for author queries), each with its own login.
+- **query-engine owns its tables, in the `query_engine` schema.** `query-engine/src/main/resources/query-engine/schema.sql`
+  (`drafted_query`, `published_query`, `realm_role`, `realm_group`) runs on every service startup as
+  `query_engine_owner`; all statements are idempotent. Disable with `query-engine.schema.initialize=false`. Each domain's
+  projection tables stay in `public`, seeded by its own `docker/init` (as the admin). The logins are created by `./gradlew provision`
+  in the service (see "Security protocol").
 - **Separate docker compose per service** (`<service>/docker/docker-compose.yml`): its own Postgres + the service container,
   independent networks and lifecycles.
 - Reactive end to end (WebFlux → reactive service → R2DBC), Java 25, no in-memory lifecycle state.
@@ -72,8 +76,13 @@ Without the script:
 
 ```bash
 (cd query-engine && ./gradlew publishToMavenLocal)
-(cd order-query && ./gradlew bootJar) && docker compose -f order-query/docker/docker-compose.yml up -d --build --wait
-(cd inventory-query && ./gradlew bootJar) && docker compose -f inventory-query/docker/docker-compose.yml up -d --build --wait
+# per domain: database first, then its logins (read from the service's application.yml), then the service
+docker compose -f order-query/docker/docker-compose.yml up -d --wait postgres
+(cd order-query && ./gradlew bootJar provision)
+docker compose -f order-query/docker/docker-compose.yml up -d --build --wait
+docker compose -f inventory-query/docker/docker-compose.yml up -d --wait postgres
+(cd inventory-query && ./gradlew bootJar provision)
+docker compose -f inventory-query/docker/docker-compose.yml up -d --build --wait
 (cd query-builder-ui && npm run dev)
 ```
 
@@ -96,7 +105,7 @@ Full design, acceptance criteria and measured findings: `docs/reactive_R2DBC_Cur
 - **Contract:** `Accept: application/x-ndjson` streams one row per line, reading Postgres through a cursor in `fetchSize`
   portions only as fast as the client reads. `application/json` stays the default but is capped (`413 RESULT_TOO_LARGE`
   above 1000 rows). A failure after the first byte aborts the connection (no marker line).
-- **Per-query `fetchSize`:** optional in the draft (`fetchSize`, 1 to 10000), stored on `query_draft` and `published_query`,
+- **Per-query `fetchSize`:** optional in the draft (`fetchSize`, 1 to 10000), stored on `drafted_query` and `published_query` (`query_draft` before the schema move),
   `INVALID_FETCH_SIZE` on a bad value. The UI YAML editor passes it through.
 - **Protection:** a separate projection pool (acquire timeout 3 s, `statement_timeout` 60 s) so slow streams cannot starve
   `/engine/*`; stall timeout 30 s and max duration 10 min fail the stream rather than ending it; pool exhaustion is
@@ -174,21 +183,41 @@ the findings do not depend on the row count). Full detail is in `docs/reactive_R
 - Verified live on order-query: draft, lock (409 with the new message), simulate, list, a draft backdated 60 days still found
   and publishable, and the old column dropped on restart. UI list and wizard no longer show "expires".
 
-## Planned: SELECT-only queries (not built)
-Today the validator does not parse SQL, so a drafted `DELETE` / `UPDATE` / `CREATE` is accepted and simulate would run it
-(the projection pool uses the service's own database user, a superuser in the dev containers). The plan, in three layers
-(a read-only database role plus a read-only session on the projection pool; a draft-time SQL lexer with specific error codes;
-re-check at publish and a startup audit of stored queries), with phases R0 to R4, acceptance criteria AC-R1 to AC-R9 and the
-open decisions, is in `docs/reactive_R2DBC_Cursor-impl.md`, section 12. First step when resuming: record the performance
-baseline (R0), then the database layer (R1).
+## Security protocol (built 2026-10-25)
+Full design, DDL, rules and what was checked: `docs/security_protocol.md`. It replaces the SELECT-only plan in section 12 of
+`docs/reactive_R2DBC_Cursor-impl.md`.
+
+- **Schema and logins.** Engine tables moved to the `query_engine` schema (`query_draft` renamed `drafted_query`), owned by
+  `query_engine_owner`. Author queries run as `query_engine_ro` (`pg_read_all_data`, owns nothing). The service keeps its
+  own login for the projections. One shared template in the library (`query-engine/provision.sql`) creates them:
+  `./gradlew provision` in a service reads that service's `application.yml` (service login = `spring.r2dbc.*`, engine login =
+  `query-engine.store.*`, reader = `query-engine.projection.*`, database from the URL) and runs it as the admin login
+  (`postgres`, from the environment, never in the yml). Safe to run again, e.g. after changing a password. Existing databases:
+  run `query-engine/db/migrate_public_to_query_engine.sql` first.
+- **Read-only.** Every projection query runs in `BEGIN READ ONLY` on its own pool. Postgres refuses writes there, also from a
+  `SECURITY DEFINER` function, and a query that flipped `default_transaction_read_only` on its pooled session did not get past it.
+- **SQL lexer.** `SqlLexer` / `SqlGuard` (backend) and `src/sql/sqlGuard.js` (UI, live "SQL checks" panel) reject anything but
+  a single SELECT, at draft, simulate, publish and call time, and audit stored queries at startup. Both run
+  `query-engine/src/test/resources/sql-guard-cases.json`. `vitest` is new in the UI (`npm test`). The draft step flags any invalid
+  definition (SQL, YAML, queryName, params, fetchSize) as you type: red panel, red editor outline, header badge, footer note;
+  after a save the server's list replaces it. Checked in headless Chrome.
+- **Startup check.** The service refuses to start unless the engine and projection logins differ, neither is a superuser, and the
+  projection login can write no table. `query-engine.security.mode=warn` starts anyway for an unprovisioned dev machine.
+- **Config is YAML.** Both services use `application.yml` (the `.properties` files are gone). `schema.sql` no longer uses `ALTER`:
+  `fetch_size` is part of the `CREATE TABLE`s (older tables get it from the migration script).
+- **Verified** live in both domains (details in the doc). **Not verified:** Postgres other than 14,
+  PgBouncer, a production provisioning run, the 100K / 6-pull memory baseline.
+- **Known trade-offs:** `pg_read_all_data` lets the reader see `query_engine` when the lexer is off (the lexer rejects
+  `query_engine.`); a column literally named `insert` / `update` / `delete` / `merge` must be quoted; a write that reaches
+  the database comes back as `500 QUERY_EXECUTION_FAILED` (SQLSTATE 25006), not a dedicated code.
 
 ## Possible next steps
 
 - Fix the 77.8% halt (open issue 1: `statement_timeout` on streams, the dev proxy hiding aborts, a page-side watchdog).
-- Read-only queries (section 12 of the impl doc).
+- Map SQLSTATE 25006 / 42501 from the projection pool to a dedicated error code (e.g. `QUERY_NOT_READ_ONLY`).
 - Open the Downstream demo page in a browser and watch memory and the Postgres connection while it runs.
 - Quiet the post-commit error logging and investigate the one unexplained stream stall.
 - Auth is still a stand-in: `X-Author` and `X-Roles` headers. `/data-query` defaults to `senior_DBA` without `X-Roles`.
 - The roles catalog is seeded locally per database; swap for the real IdP (e.g. Keycloak) later.
 - Publish `query-engine` to a shared Maven repository instead of Maven Local, so services build on other machines and in CI.
-- No automated tests yet.
+- Automated tests are thin: `StreamGuardsTest` and `SqlGuardTest` in the library, `vitest` for the SQL lexer in the UI. Nothing covers the stores or the lifecycle yet.

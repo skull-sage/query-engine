@@ -700,10 +700,14 @@ a hidden tab, a machine without Docker, or non-Chromium browsers. One observatio
 no container memory limit the service's memory sits at roughly 460 MiB during a run (the JVM grows its heap), so the memory
 chart is flat but not small; use the low-memory override (`docker-compose.lowmem.yml`) to see it against a real limit.
 
-## 12. Read-only queries: only SELECT may be drafted or run (plan, not built)
+## 12. Read-only queries: only SELECT may be drafted or run (first plan, superseded by docs/security_protocol.md)
 
-Status: planned 2026-10-19, nothing implemented. Written so the work can be picked up later. It is separate from backpressure
-but touches the same files (`QueryValidator`, `ProjectionDatabase`, `ProjectionStoreExecutor`).
+Status: superseded 2026-10-25. This was the first plan; the work was done as described in `docs/security_protocol.md`, which
+is the current design and records what was checked. Differences: the read-only database user is `query_engine_ro` (one per
+database, not per table set) and the engine's tables also moved to their own schema and login; the explicit `BEGIN READ ONLY`
+per query was added on top of the session setting; error codes are `SQL_*` (`SQL_NOT_SELECT`, `SQL_DATA_MODIFYING`, ...) and
+`SQL_REJECTED`; the SQLSTATE 25006 / 42501 mapping to `QUERY_NOT_READ_ONLY` was not built. The text below is kept as the
+original reasoning.
 
 ### 12.1 The gap
 

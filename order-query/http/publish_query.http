@@ -3,7 +3,7 @@
 ### simulate time) and the drafted vs. non-drafted distinction (what /engine/drafted returns
 ### before a draft exists, while one is open, and after it's gone via discard/publish).
 ### No versioning/revision concepts here -- drafting or publishing a queryName again simply
-### overwrites what was there before. All of this is backed by Postgres (query_draft and
+### overwrites what was there before. All of this is backed by Postgres (drafted_query and
 ### published_query tables) -- there is no in-memory state to lose on a restart.
 ###
 ### Content types: /engine/draft accepts and returns application/json. /engine/draft-yml is a
@@ -31,7 +31,7 @@ Content-Type: application/json
   "queryName": "{{queryName}}"
 }
 
-### 1. Draft — validates the entry and opens a draft for queryName, persisted to query_draft.
+### 1. Draft — validates the entry and opens a draft for queryName, persisted to drafted_query.
 POST {{baseUrl}}/engine/draft
 Content-Type: application/json
 X-Author: {{author}}
@@ -157,7 +157,7 @@ X-Author: {{author}}
 
 ### 7a. Drafted (resume) — non-drafted case: 404 DRAFT_NOT_FOUND. Publish (step 7) deleted the
 ### draft; queryName is now published but has no open draft, which /engine/drafted does not see
-### (it only looks at query_draft, not published_query -- see /engine/list for a view that
+### (it only looks at drafted_query, not published_query -- see /engine/list for a view that
 ### shows both).
 POST {{baseUrl}}/engine/drafted
 Content-Type: application/json

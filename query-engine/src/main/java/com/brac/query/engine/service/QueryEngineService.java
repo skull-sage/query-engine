@@ -4,6 +4,7 @@ import com.brac.query.engine.config.SimulateProperties;
 import com.brac.query.engine.config.StreamProperties;
 import com.brac.query.engine.execution.ProjectionException;
 import com.brac.query.engine.validation.QueryValidator;
+import com.brac.query.engine.validation.SqlGuard;
 import com.brac.query.engine.execution.ProjectionStoreExecutor;
 import com.brac.query.engine.dto.DraftRequest;
 import com.brac.query.engine.dto.DraftResponse;
@@ -23,11 +24,14 @@ import com.brac.query.engine.model.PublishedQuery;
 import com.brac.query.engine.model.ParamType;
 import com.brac.query.engine.model.QueryEntry;
 import com.brac.query.engine.model.ValidatedQuery;
+import com.brac.query.engine.model.ValidationError;
 import com.brac.query.engine.store.DraftStore;
+import com.brac.query.engine.store.EngineDatabase;
 import com.brac.query.engine.store.PublishedQueryRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional;
 import reactor.core.publisher.Mono;
 
 import java.time.Instant;
@@ -47,19 +51,27 @@ import java.util.concurrent.ThreadLocalRandom;
  */
 @Service
 public class QueryEngineService {
+
+    private static final Logger log = LoggerFactory.getLogger(QueryEngineService.class);
+
     private final DraftStore draftStore;
     private final PublishedQueryRepository publishedQueries;
+    private final EngineDatabase engineDatabase;
     private final QueryValidator validator;
+    private final SqlGuard sqlGuard;
     private final ProjectionStoreExecutor executor;
     private final StreamProperties streamProperties;
     private final SimulateProperties simulateProperties;
 
-    public QueryEngineService(DraftStore draftStore, PublishedQueryRepository publishedQueries, QueryValidator validator,
+    public QueryEngineService(DraftStore draftStore, PublishedQueryRepository publishedQueries, EngineDatabase engineDatabase,
+                               QueryValidator validator, SqlGuard sqlGuard,
                                ProjectionStoreExecutor executor, StreamProperties streamProperties,
                                SimulateProperties simulateProperties) {
         this.draftStore = draftStore;
         this.publishedQueries = publishedQueries;
+        this.engineDatabase = engineDatabase;
         this.validator = validator;
+        this.sqlGuard = sqlGuard;
         this.executor = executor;
         this.streamProperties = streamProperties;
         this.simulateProperties = simulateProperties;
@@ -111,6 +123,10 @@ public class QueryEngineService {
                     return Mono.error(new EngineException("DRAFT_INVALID", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
                             "Draft for '" + queryName + "' has validation errors and cannot be simulated"));
                 }
+                EngineException sqlError = rejectedSql(queryName, record.validatedQuery().sql(), true);
+                if (sqlError != null) {
+                    return Mono.error(sqlError);
+                }
                 EngineException paramError = validateParams(queryName, record, params);
                 if (paramError != null) {
                     return Mono.error(paramError);
@@ -136,7 +152,6 @@ public class QueryEngineService {
         });
     }
 
-    @Transactional
     public Mono<PublishResponse> publish(PublishRequest request, String publishedBy) {
         return Mono.defer(() -> {
             String queryName = requireQueryName(request.queryName());
@@ -154,6 +169,11 @@ public class QueryEngineService {
                 // allowed_roles are chosen at publish time (realm roles and/or groups from the
                 // publish dialog), not during drafting. They override whatever the draft carried
                 // and become the RBAC gate enforced in invoke().
+                EngineException sqlError = rejectedSql(queryName, record.validatedQuery().sql(), true);
+                if (sqlError != null) {
+                    return Mono.error(sqlError);
+                }
+
                 List<String> allowedRoles = request.allowedRoles() == null ? List.of() : request.allowedRoles().stream()
                         .map(r -> r == null ? null : r.trim())
                         .filter(r -> r != null && !r.isEmpty())
@@ -173,9 +193,10 @@ public class QueryEngineService {
                 Instant now = Instant.now();
                 PublishedQuery published = new PublishedQuery(queryName, publishedEntry, publishedValidated, now, publishedBy);
 
-                return publishedQueries.publish(published)
+                // Saving the published query and deleting the draft commit together or not at all.
+                return engineDatabase.inTransaction(publishedQueries.publish(published)
                         .then(draftStore.delete(queryName))
-                        .thenReturn(new PublishResponse(queryName, "PUBLISHED", now, publishedBy));
+                        .thenReturn(new PublishResponse(queryName, "PUBLISHED", now, publishedBy)));
             });
         });
     }
@@ -254,6 +275,11 @@ public class QueryEngineService {
                                 "Role(s) " + callerRoles + " not permitted to invoke '" + queryName + "'"));
                     }
 
+                    EngineException sqlError = rejectedSql(queryName, published.validatedQuery().sql(), false);
+                    if (sqlError != null) {
+                        return Mono.<Invocation>error(sqlError);
+                    }
+
                     EngineException paramError = validateInvokeParams(queryName, published.validatedQuery(), params);
                     if (paramError != null) {
                         return Mono.<Invocation>error(paramError);
@@ -284,6 +310,30 @@ public class QueryEngineService {
     }
 
     // --- helpers -----------------------------------------------------------------------------
+
+    /**
+     * {@code SQL_REJECTED} when the SQL is not a single read-only SELECT, otherwise null. Drafting
+     * already refuses such SQL, so this catches a query stored before the rules existed, or after
+     * they were tightened. An author sees what is wrong; a calling client app only sees the codes
+     * (the detail is logged).
+     */
+    private EngineException rejectedSql(String queryName, String sql, boolean exposeDetail) {
+        List<ValidationError> problems = sqlGuard.analyze(sql).errors();
+        if (problems.isEmpty()) {
+            return null;
+        }
+        String codes = String.join(", ", problems.stream().map(ValidationError::code).distinct().toList());
+        if (!exposeDetail) {
+            log.warn("Refusing to run '{}': its SQL is no longer accepted ({}). Detail: {}", queryName, codes, problems);
+            return new EngineException("SQL_REJECTED", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
+                    "'" + queryName + "' can't run because its SQL is not a read-only SELECT (" + codes
+                            + "). Ask its author to fix and publish it again.");
+        }
+        return new EngineException("SQL_REJECTED", HttpStatus.UNPROCESSABLE_ENTITY, queryName,
+                "The SQL of '" + queryName + "' is not a read-only SELECT: " + problems.get(0).message()
+                        + (problems.size() > 1 ? " (and " + (problems.size() - 1) + " more: " + codes + ")" : "")
+                        + ". Edit the draft and save it again.");
+    }
 
     private static DraftResponse toDraftResponse(DraftRecord record) {
         return new DraftResponse(

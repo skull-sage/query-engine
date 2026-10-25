@@ -130,18 +130,21 @@ What the code does today (query-engine `0.0.1-SNAPSHOT`, 2026-10-17). The design
 
 ### Where it lives
 
-`query-engine` is a library, not an application. Each domain query service (`order-query` on 8081, `inventory-query` on 8082) embeds it through `QueryEngineAutoConfiguration`, which registers the endpoints below and creates the engine's own tables in the service's database on startup (`query-engine/schema.sql`, idempotent). The service supplies only its `spring.r2dbc.*` connection and its projection tables. Everything is reactive (WebFlux controller, then service, then R2DBC `DatabaseClient`), and no query lifecycle state is held in memory.
+`query-engine` is a library, not an application. Each domain query service (`order-query` on 8081, `inventory-query` on 8082) embeds it through `QueryEngineAutoConfiguration`, which registers the endpoints below and creates the engine's own tables in the `query_engine` schema of the service's database on startup (`query-engine/schema.sql`, idempotent). The service supplies its `spring.r2dbc.*` connection and its projection tables; the engine opens two more pools of its own, one for its tables and one for author queries, each of which logs in as a different database user so that published SQL can only read (see `docs/security_protocol.md`). Everything is reactive (WebFlux controller, then service, then R2DBC `DatabaseClient`), and no query lifecycle state is held in memory.
 
 | Piece | Class (package `com.brac.query.engine`) | Job |
 | --- | --- | --- |
 | Endpoints | `web.EngineController`, `web.DataQueryController`, `web.QueryRolesController` | `/engine/*`, `/data-query`, `/query-roles` |
 | Error mapping | `web.GlobalExceptionHandler`, `error.EngineException` | One JSON error shape `{ error, message, queryName }` |
 | Lifecycle | `service.QueryEngineService` | Draft, simulate, publish, discard, list, invoke |
-| Validator | `validation.QueryValidator` | Checks `:param` tokens against declared params; builds `ValidatedQuery` |
-| Draft store | `store.DraftStore` | Table `query_draft` |
-| Registry | `store.PublishedQueryRepository` | Table `published_query` |
-| Identity catalog | `store.QueryRolesRepository` | Tables `realm_role`, `realm_group` |
-| Executor | `execution.ProjectionStoreExecutor` | Runs the SQL template against the domain's projection tables |
+| Validator | `validation.QueryValidator` | Runs the SQL checks, then checks `:param` tokens against declared params; builds `ValidatedQuery` |
+| SQL checks | `validation.SqlLexer`, `validation.SqlGuard` | Tokenizes the SQL; rejects anything that is not a single read-only SELECT; finds the `:param` tokens |
+| Engine pool | `store.EngineDatabase` | Own pool and transaction for the tables below, logging in as `query_engine_owner` |
+| Draft store | `store.DraftStore` | Table `query_engine.drafted_query` |
+| Registry | `store.PublishedQueryRepository` | Table `query_engine.published_query` |
+| Identity catalog | `store.QueryRolesRepository` | Tables `query_engine.realm_role`, `query_engine.realm_group` |
+| Executor | `execution.ProjectionStoreExecutor` | Runs the SQL template against the domain's projection tables, on the `query_engine_ro` pool, inside a read-only transaction |
+| Startup check | `security.SecurityStartupCheck` | Refuses to start if the two logins are not separate and read-only as required; audits stored queries |
 | JSONB codec | `store.JsonbSupport` | Reads and writes JSONB columns as r2dbc-postgresql `Json` |
 
 ### How a query is handled
@@ -149,32 +152,32 @@ What the code does today (query-engine `0.0.1-SNAPSHOT`, 2026-10-17). The design
 **Draft** (`POST /engine/draft`, or `/engine/draft-yml` for YAML bodies; both run the same logic)
 1. `queryName` must match `^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$` (`{module}.{name}`), otherwise `400 INVALID_QUERY_NAME`.
 2. Lock check: a draft held by a different `X-Author` gives `409 DRAFT_LOCKED`.
-3. Validation, without parsing SQL: the regex `:([a-zA-Z_][a-zA-Z0-9_]*)` finds the parameter tokens in `sql`, and they are compared with the declared `params`. Problems become `UNDECLARED_PARAM`, `UNUSED_PARAM`, `UNKNOWN_PARAM_TYPE` or `MISSING_SQL` entries in `errors`.
+3. Validation: `SqlGuard` tokenizes `sql` (skipping strings, quoted names and comments) and checks it is a single read-only SELECT; problems are `SQL_*` entries in `errors` (`SQL_NOT_SELECT`, `SQL_MULTIPLE_STATEMENTS`, `SQL_DATA_MODIFYING`, `SQL_FORBIDDEN_FUNCTION` and so on, listed in `docs/security_protocol.md`). It also finds the `:param` tokens, which are compared with the declared `params`: `UNDECLARED_PARAM`, `UNUSED_PARAM`, `UNKNOWN_PARAM_TYPE` or `MISSING_SQL`. Casts such as `x::text` and colons inside strings are not parameters.
 4. With errors, the draft is stored with `status = DRAFT` and `validated_query = NULL`. Without errors it is `VALIDATED` and carries a `ValidatedQuery { sql, params: [{ name, type }], allowedRoles }`.
 5. The draft is always stored (upsert by `query_name`), even with errors, with `simulated = false`. Drafts do not expire. The response returns the status, errors, validated descriptor, the submitted `entry { sql, params }` and `simulated`.
 
 **Simulate** (`POST /engine/simulate`)
-1. Loads the draft (`404 DRAFT_NOT_FOUND` if missing). A `DRAFT`-status draft gives `422 DRAFT_INVALID`.
+1. Loads the draft (`404 DRAFT_NOT_FOUND` if missing). A `DRAFT`-status draft gives `422 DRAFT_INVALID`. The SQL is checked again; a failure is `422 SQL_REJECTED`.
 2. Checks the supplied params against the validated list: every declared param must be present and type-compatible, otherwise `400 INVALID_ARGUMENT`.
-3. Executes the SQL template against the projection tables (see "Executor" below). Simulate is capped at 200 rows (`query-engine.simulate.max-rows`).
+3. Executes the SQL template against the projection tables (see "Executor" below) in a read-only transaction. Simulate is capped at 200 rows (`query-engine.simulate.max-rows`).
 4. Saves the draft with `simulated = true`.
 5. Returns the rows, `rowCount`, `truncated` and `metrics { latencyMs, rowsScanned, planCost }`. Only `latencyMs` is measured. `rowsScanned` is the number of rows returned, and `planCost` is a random placeholder, not a PostgreSQL planner figure. `redactedFields` is always empty.
 
 **Publish** (`POST /engine/publish`, body `{ queryName, allowed_roles }`)
-1. Loads the draft. Not simulated gives `422 NOT_SIMULATED`.
+1. Loads the draft. Not simulated gives `422 NOT_SIMULATED`. The SQL is checked again; a failure is `422 SQL_REJECTED`.
 2. `allowed_roles` are taken from the publish request (trimmed, blanks dropped, de-duplicated); none left gives `422 NO_ALLOWED_ROLES`. They replace whatever the draft carried. An `allowed_roles` field on the draft body is still accepted and stored on the draft, but publish ignores it.
-3. Upserts `published_query` with the chosen roles and deletes the draft. The method is `@Transactional`, so the two steps are meant to be atomic (not yet verified under failure).
+3. Upserts `published_query` with the chosen roles and deletes the draft in one transaction on the engine's pool (`EngineDatabase.inTransaction`), so both happen or neither does. Checked by making the draft delete fail: nothing was published and the draft stayed.
 4. Returns `201 { queryName, status: "PUBLISHED", publishedAt, publishedBy }`, where `publishedBy` is the `X-Author` header.
 
 **Discard** (`POST /engine/discard`) loads the draft (`404` if missing) and deletes it. A published version of the same name is untouched.
 
-**List** (`POST /engine/list`) reads every `published_query` row and every `query_draft` row, merges them by `queryName` in name order, and returns `{ published, draft }` per name (either can be `null`). Filters: `module`, `queryNamePrefix`, `status`, and `author` (matches drafts only). `page.size` defaults to 50 (max 200). `page.cursor` is ignored.
+**List** (`POST /engine/list`) reads every `published_query` row and every `drafted_query` row, merges them by `queryName` in name order, and returns `{ published, draft }` per name (either can be `null`). Filters: `module`, `queryNamePrefix`, `status`, and `author` (matches drafts only). `page.size` defaults to 50 (max 200). `page.cursor` is ignored.
 
 **Invoke** (`POST /data-query`, body `{ name, params }`, caller roles in the `X-Roles` header)
 1. A name containing `.` is used as is. A bare name must match exactly one published name by suffix, otherwise `404 QUERY_NOT_FOUND`.
 2. Loads the published query (`404 QUERY_NOT_FOUND` if missing).
 3. Role gate: the comma-separated `X-Roles` values (default `senior_DBA` when the header is absent) must include at least one of the query's `allowedRoles`, by exact string match. Realm roles and groups share one name space. Otherwise `403 FORBIDDEN`.
-4. Param check as in simulate (`400 INVALID_ARGUMENT`).
+4. The stored SQL is checked again (`422 SQL_REJECTED`, with only the codes in the message; the detail is logged), then the params as in simulate (`400 INVALID_ARGUMENT`).
 5. Executes the SQL and returns a JSON array of rows, capped at 200, with no signal when rows were dropped. The response is fully buffered; see `docs/reactive_R2DBC_Cursor-impl.md` for the streaming plan.
 
 **Identity catalog** (`GET /query-roles`) returns `{ realmRoles: [{ name, description }], groups: [{ name, path, description }] }` from the two catalog tables. The UI uses it to choose `allowed_roles` at publish time and a calling identity at run time.
@@ -199,9 +202,9 @@ Types are declared as text in `params` (case-insensitive) and resolved to `Param
 
 ### Database tables
 
-Each domain service has its own database. It contains the engine's four tables (created by `schema.sql`) plus that domain's projection tables.
+Each domain service has its own database. It contains the engine's four tables in the `query_engine` schema (created by `schema.sql`, owned by `query_engine_owner`) plus that domain's projection tables in `public`. Every statement names the schema. `docs/security_protocol.md` has the logins, grants and the script that moves an older database.
 
-**`query_draft`** (the draft store; one open draft per query)
+**`query_engine.drafted_query`** (the draft store; one open draft per query; called `query_draft` before the schema move)
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -216,7 +219,7 @@ Each domain service has its own database. It contains the engine's four tables (
 | `author` | `VARCHAR(255)` | `X-Author` of the last saver; the lock holder |
 | `updated_at` | `TIMESTAMPTZ` | set by draft and simulate. Drafts have no expiry; the old `expires_at` column is dropped on startup |
 
-**`published_query`** (the registry; one live version per query, no history)
+**`query_engine.published_query`** (the registry; one live version per query, no history)
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -224,21 +227,21 @@ Each domain service has its own database. It contains the engine's four tables (
 | `sql_text` | `TEXT` | Copied from the draft |
 | `params` | `JSONB` | Declared types, copied from the draft |
 | `allowed_roles` | `JSONB` | Roles/groups chosen at publish, e.g. `["data_analyst","finance"]` |
-| `validated_query` | `JSONB` NOT NULL | Same shape as in `query_draft`; `allowedRoles` holds the roles chosen at publish. The role gate and the list read this copy |
+| `validated_query` | `JSONB` NOT NULL | Same shape as in `drafted_query`; `allowedRoles` holds the roles chosen at publish. The role gate and the list read this copy |
 | `published_at`, `published_by` | `TIMESTAMPTZ`, `VARCHAR(255)` | When and by whom (`X-Author`) |
 
-**`realm_role`** (`name` PK, `description`) and **`realm_group`** (`name` PK, `path`, `description`) are the identity catalog behind `/query-roles`. They are seeded by `schema.sql` (8 roles, 7 groups). In a real deployment they would mirror the enterprise identity provider.
+**`query_engine.realm_role`** (`name` PK, `description`) and **`query_engine.realm_group`** (`name` PK, `path`, `description`) are the identity catalog behind `/query-roles`. They are seeded by `schema.sql` (8 roles, 7 groups). In a real deployment they would mirror the enterprise identity provider.
 
 Who touches the tables:
 
 | Operation | Reads | Writes |
 | --- | --- | --- |
-| draft / draft-yml | `query_draft` (lock check) | `query_draft` (upsert) |
-| drafted | `query_draft` | none |
-| simulate | `query_draft`, projection tables | `query_draft` (`simulated`, `updated_at`) |
-| publish | `query_draft` | `published_query` (upsert), `query_draft` (delete) |
-| discard | `query_draft` | `query_draft` (delete) |
-| list | `query_draft`, `published_query` | none |
+| draft / draft-yml | `drafted_query` (lock check) | `drafted_query` (upsert) |
+| drafted | `drafted_query` | none |
+| simulate | `drafted_query`, projection tables | `drafted_query` (`simulated`, `updated_at`) |
+| publish | `drafted_query` | `published_query` (upsert), `drafted_query` (delete) |
+| discard | `drafted_query` | `drafted_query` (delete) |
+| list | `drafted_query`, `published_query` | none |
 | `/data-query` | `published_query`, projection tables | none |
 | `/query-roles` | `realm_role`, `realm_group` | none |
 
@@ -253,8 +256,8 @@ A 50,000-row `order_history_projection` for the streaming demo exists in `order-
 
 ### Known limitations as built
 
-- The `:name` scan reads every `:identifier` in the SQL as a parameter. A Postgres cast such as `x::text`, or a colon inside a string literal, produces a false `UNDECLARED_PARAM`. Use `CAST(x AS text)` instead.
-- Nothing restricts what the SQL does. Published SQL runs with the service's full database rights, including writes.
+- Published SQL is read-only by construction: it must pass the SQL checks (single SELECT, no writes, no denylisted functions, no `query_engine` schema), it runs as `query_engine_ro` and it runs in `BEGIN READ ONLY`. The checks read text and cannot see inside a function; the login and the transaction are what stop writes. `query_engine_ro` has `pg_read_all_data`, so with the checks switched off it can read the engine's tables. See `docs/security_protocol.md`.
+- A column literally named `insert`, `update`, `delete` or `merge` must be quoted in the SQL.
 - Malformed `date` / `datetime` / number strings are rejected at call time as `400 INVALID_ARGUMENT`.
 - Simulate metrics are placeholders (see Simulate above).
 - Drafts never expire. A draft keeps its author's lock until it is published or discarded, so a draft left behind by someone else blocks other authors from drafting that `queryName` until it is discarded (any caller can discard, see below).
@@ -270,7 +273,7 @@ A 50,000-row `order_history_projection` for the streaming demo exists in `order-
 | `enum(A, B, ...)` param type | Not implemented; seven types only (table above) |
 | Only the draft's author can simulate, publish or discard; `chief_DBA` can force-discard | Not enforced (see limitations) |
 | Drafts expire after a TTL; a scheduled sweeper deletes them with a `DRAFT_EXPIRED` audit entry | Dropped on purpose: drafts never expire and there is no sweeper |
-| Simulation under a cost limiter with timeout and `EXPLAIN`, plus OPA redaction | Row cap of 200 only; no timeout, `EXPLAIN` or OPA |
+| Simulation under a cost limiter with timeout and `EXPLAIN`, plus OPA redaction | Row cap of 200 only; no timeout, `EXPLAIN` or OPA. The SQL runs read-only |
 | `list` supports `filter.author = "me"` and `page.cursor` | `"me"` is not special; cursor ignored |
 | Phase 2: JWT, published-query cache and change events, OPA, jOOQ binder, arity, NDJSON streaming, `X-Next-Cursor` / `X-Redacted-Fields` | JWT, cache, OPA, jOOQ binder, arity, `X-Next-Cursor` / `X-Redacted-Fields` are not built. Roles come from `X-Roles`; each call reads the registry. NDJSON streaming with backpressure is built (`Accept: application/x-ndjson`; JSON is capped at 1000 rows with `413`); see `docs/reactive_R2DBC_Cursor-impl.md` |
 | Authoring role precondition for Phase 1 | Not enforced |
@@ -760,7 +763,7 @@ The OPA/Rego policy evaluation introduced in the Read Engine PRD carries over un
 
 ## Published query store additions
 
-As built, the published query store is the `published_query` table; its exact columns are in "Current implementation (as built)". In design terms:
+As built, the published query store is the `query_engine.published_query` table; its exact columns are in "Current implementation (as built)". In design terms:
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -771,7 +774,7 @@ As built, the published query store is the `published_query` table; its exact co
 | `allowedRoles` | string[] | `allowed_roles` chosen at publish — the operation-level gate |
 | `publishedAt` / `publishedBy` | timestamp / string | Audit trail |
 
-Status is implied by the table: anything in `published_query` is `PUBLISHED`; `DRAFT` and `VALIDATED` exist only in `query_draft`. There is no separate `module` field; it is the part of `queryName` before the dot.
+Status is implied by the table: anything in `published_query` is `PUBLISHED`; `DRAFT` and `VALIDATED` exist only in `drafted_query`. There is no separate `module` field; it is the part of `queryName` before the dot.
 
 ## Open questions
 

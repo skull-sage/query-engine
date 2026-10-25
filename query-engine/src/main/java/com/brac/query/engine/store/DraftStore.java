@@ -20,15 +20,16 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Draft Store backed by the {@code query_draft} table in Postgres, accessed reactively through
- * {@link DatabaseClient} (R2DBC) -- no blocking JDBC, no in-memory map. At most one open draft
+ * Draft Store backed by the {@code query_engine.drafted_query} table in Postgres, accessed reactively
+ * through {@link DatabaseClient} (R2DBC) on the engine's own pool ({@link EngineDatabase}) -- no
+ * blocking JDBC, no in-memory map. At most one open draft
  * exists per queryName; drafting again overwrites the row via upsert.
  */
 @Component
 public class DraftStore {
 
     private static final String UPSERT = """
-            INSERT INTO query_draft
+            INSERT INTO query_engine.drafted_query
                 (query_name, sql_text, params, allowed_roles, fetch_size, validated_query,
                  status, errors, simulated, author, updated_at)
             VALUES
@@ -50,13 +51,13 @@ public class DraftStore {
     private final DatabaseClient db;
     private final JsonbSupport jsonb;
 
-    public DraftStore(DatabaseClient db, JsonbSupport jsonb) {
-        this.db = db;
+    public DraftStore(EngineDatabase engine, JsonbSupport jsonb) {
+        this.db = engine.client();
         this.jsonb = jsonb;
     }
 
     public Mono<DraftRecord> find(String queryName) {
-        return db.sql("SELECT * FROM query_draft WHERE query_name = :queryName")
+        return db.sql("SELECT * FROM query_engine.drafted_query WHERE query_name = :queryName")
                 .bind("queryName", queryName)
                 .map((row, meta) -> toDraftRecord(row))
                 .one();
@@ -85,13 +86,13 @@ public class DraftStore {
     }
 
     public Mono<Void> delete(String queryName) {
-        return db.sql("DELETE FROM query_draft WHERE query_name = :queryName")
+        return db.sql("DELETE FROM query_engine.drafted_query WHERE query_name = :queryName")
                 .bind("queryName", queryName)
                 .fetch().rowsUpdated().then();
     }
 
     public Flux<DraftRecord> findAll() {
-        return db.sql("SELECT * FROM query_draft")
+        return db.sql("SELECT * FROM query_engine.drafted_query")
                 .map((row, meta) -> toDraftRecord(row))
                 .all();
     }

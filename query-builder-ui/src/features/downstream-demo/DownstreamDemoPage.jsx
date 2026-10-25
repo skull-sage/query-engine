@@ -307,10 +307,10 @@ function ResourcePanel({ monitor, service }) {
 function ReviewAids({ domain, demo }) {
   const container = `${domain.service}-app`
   const pgContainer = `${domain.service}-postgres`
-  const dbUser = domain.service.replace('-', '_')
+  const dbName = domain.service.replace('-', '_')
   const table = demo.sql.match(/FROM\s+(\S+)/i)?.[1] ?? ''
   const logs = `docker logs ${container} 2>&1 | grep "data-query query" | tail -3`
-  const activity = `docker exec ${pgContainer} psql -U ${dbUser} -d ${dbUser} -c "select state, wait_event, left(query, 60) as query from pg_stat_activity where query ilike '%${table}%' and pid <> pg_backend_pid()"`
+  const activity = `docker exec ${pgContainer} psql -U postgres -d ${dbName} -c "select state, wait_event, left(query, 60) as query from pg_stat_activity where query ilike '%${table}%' and pid <> pg_backend_pid()"`
   return (
     <section className="rounded-lg bg-slate-50 p-5 ring-1 ring-slate-200" aria-label="How to check it">
       <h2 className="text-sm font-semibold text-slate-900">Check it from outside</h2>

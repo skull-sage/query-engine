@@ -23,11 +23,16 @@ export default function Alert({ variant = 'info', title, children, actions, clas
   )
 }
 
+// Plain titles for engine codes whose raw name would mean little to someone using the UI.
+const CODE_TITLES = {
+  SQL_REJECTED: 'Not a read-only SELECT',
+}
+
 /** Renders an EngineError (or any Error) with its engine code as the title. */
 export function ErrorAlert({ error, title, actions, className }) {
   if (!error) return null
   return (
-    <Alert variant="error" title={title || error.code || 'Something went wrong'} actions={actions} className={className}>
+    <Alert variant="error" title={title || CODE_TITLES[error.code] || error.code || 'Something went wrong'} actions={actions} className={className}>
       {error.message || String(error)}
     </Alert>
   )

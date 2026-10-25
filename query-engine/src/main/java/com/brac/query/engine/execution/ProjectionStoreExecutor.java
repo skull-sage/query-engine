@@ -37,6 +37,10 @@ import java.util.concurrent.TimeoutException;
  * the rows piling up in memory. {@link #execute} is the bounded variant for callers that need a
  * list (simulate, JSON mode): it stops reading one row past its limit, which cancels the cursor.
  *
+ * <p>Each run is wrapped in a read-only transaction ({@link ProjectionDatabase#inReadOnlyTransaction}),
+ * so a statement that would write fails in Postgres whatever the SQL says. That transaction is held
+ * for as long as the stream is open, the same time the cursor already held the connection.
+ *
  * <p>The template's {@code :paramName} placeholders are parsed and bound by name through the
  * driver's native parameter binding (translated to Postgres {@code $N} markers), so argument
  * values are never concatenated into the SQL. The bound names are exactly
@@ -70,7 +74,8 @@ public class ProjectionStoreExecutor {
             if (fetchSize > 0) {
                 spec = spec.filter(statement -> statement.fetchSize(fetchSize));
             }
-            return spec.map(ProjectionStoreExecutor::toRow).all();
+            // The author's SQL only ever runs inside BEGIN READ ONLY (see ProjectionDatabase).
+            return projection.inReadOnlyTransaction(spec.map(ProjectionStoreExecutor::toRow).all());
         }).onErrorMap(ProjectionStoreExecutor::translate);
     }
 

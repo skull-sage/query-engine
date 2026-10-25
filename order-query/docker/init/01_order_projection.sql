@@ -13,6 +13,9 @@
 -- Column names are intentionally unquoted so Postgres folds them to lowercase (orderid,
 -- branchid, ...), matching how it folds the unquoted identifiers in a query template.
 
+-- Seeded as the administrator (docker-entrypoint-initdb.d), before the database logins exist; `./gradlew provision`
+-- then lets the service login use and write these tables.
+
 CREATE TABLE IF NOT EXISTS order_projection (
     orderId      VARCHAR(32)    NOT NULL PRIMARY KEY,
     status       VARCHAR(32)    NOT NULL,

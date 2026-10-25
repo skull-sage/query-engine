@@ -9,45 +9,48 @@ import com.brac.query.engine.model.ValidationError;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
- * Validates a drafted {@link QueryEntry} and builds its {@link ValidatedQuery} descriptor
- * without parsing SQL -- see PRD "What the registry engine actually builds": scan
- * {@code :identifier} tokens and cross-check against {@code params}.
+ * Validates a drafted {@link QueryEntry} and builds its {@link ValidatedQuery} descriptor.
+ * {@link SqlGuard} first checks the SQL is a single read-only SELECT and finds its
+ * {@code :identifier} placeholders; those are then cross-checked against {@code params}.
  */
 @Component
 public class QueryValidator {
 
-    private static final Pattern PARAM_TOKEN = Pattern.compile(":([a-zA-Z_][a-zA-Z0-9_]*)");
-
     private final StreamProperties streamProperties;
+    private final SqlGuard sqlGuard;
 
-    public QueryValidator(StreamProperties streamProperties) {
+    public QueryValidator(StreamProperties streamProperties, SqlGuard sqlGuard) {
         this.streamProperties = streamProperties;
+        this.sqlGuard = sqlGuard;
     }
 
     public ValidationResult validate(QueryEntry entry) {
         List<ValidationError> errors = new ArrayList<>();
 
-        Set<String> usedTokens = extractTokens(entry.sql());
+        SqlGuard.Analysis analysis = sqlGuard.analyze(entry.sql());
+        errors.addAll(analysis.errors());
+        Set<String> usedTokens = analysis.params();
         Map<String, String> declared = entry.params() == null ? Map.of() : entry.params();
 
-        for (String token : usedTokens) {
-            if (!declared.containsKey(token)) {
-                errors.add(new ValidationError("UNDECLARED_PARAM", token,
-                        ":" + token + " is used in sql but missing from params"));
+        // When the text could not even be tokenized the placeholders are unreliable, and
+        // complaining about them would only bury the real problem.
+        if (!analysis.lexFailed()) {
+            for (String token : usedTokens) {
+                if (!declared.containsKey(token)) {
+                    errors.add(new ValidationError("UNDECLARED_PARAM", token,
+                            ":" + token + " is used in sql but missing from params"));
+                }
             }
-        }
-        for (String declaredName : declared.keySet()) {
-            if (!usedTokens.contains(declaredName)) {
-                errors.add(new ValidationError("UNUSED_PARAM", declaredName,
-                        declaredName + " is declared in params but never used in sql"));
+            for (String declaredName : declared.keySet()) {
+                if (!usedTokens.contains(declaredName)) {
+                    errors.add(new ValidationError("UNUSED_PARAM", declaredName,
+                            declaredName + " is declared in params but never used in sql"));
+                }
             }
         }
 
@@ -87,18 +90,6 @@ public class QueryValidator {
                 fetchSize
         );
         return new ValidationResult(validated, params, errors);
-    }
-
-    private Set<String> extractTokens(String sql) {
-        Set<String> tokens = new LinkedHashSet<>();
-        if (sql == null) {
-            return tokens;
-        }
-        Matcher matcher = PARAM_TOKEN.matcher(sql);
-        while (matcher.find()) {
-            tokens.add(matcher.group(1));
-        }
-        return tokens;
     }
 
     public record ValidationResult(ValidatedQuery validatedQuery, List<ParamSpec> params, List<ValidationError> errors) {
