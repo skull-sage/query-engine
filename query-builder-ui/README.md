@@ -17,14 +17,39 @@ allowed roles, and test-runs published queries the way a client app would.
 
 ## How the UI reaches the services
 
-The dev server proxies one path prefix per domain to that domain's service, so the browser never calls a service cross-origin:
+Each domain is reached in one of two ways, chosen when the dev server starts.
 
-| Prefix | Service | Override target with |
-| --- | --- | --- |
-| `/api/order` | `http://localhost:8081` (order-query) | `ORDER_QUERY_URL` |
-| `/api/inventory` | `http://localhost:8082` (inventory-query) | `INVENTORY_QUERY_URL` |
+| Mode | What the browser calls | The service needs | Use it for |
+| --- | --- | --- | --- |
+| direct (default) | the service itself, e.g. `http://localhost:8081` | CORS on for this page's origin | inspecting each service call in DevTools against the service's own origin |
+| proxy | the dev server, e.g. `http://localhost:5173/api/order`, forwarded to the service | nothing | a service that has CORS off |
 
-Domains are declared in `src/domains.js` (label, proxy prefix, service URL, sample draft); keep it in sync with `vite.config.js`.
+In direct mode the Network tab shows every request and response to `http://localhost:8081` (order-query) or `http://localhost:8082`
+(inventory-query), so they can be inspected, blocked, overridden or given breakpoints per service origin.
+
+| Domain | Service | Switch to proxy mode | Override the address |
+| --- | --- | --- | --- |
+| order | `http://localhost:8081` (order-query) | `VITE_ORDER_QUERY_MODE=proxy` | `VITE_ORDER_QUERY_URL` |
+| inventory | `http://localhost:8082` (inventory-query) | `VITE_INVENTORY_QUERY_MODE=proxy` | `VITE_INVENTORY_QUERY_URL` |
+
+The variables are read when the dev server starts, one domain at a time, so one domain can be proxied while the other is direct:
+`VITE_ORDER_QUERY_MODE=proxy ./dry-run.sh` or `VITE_ORDER_QUERY_MODE=proxy npm run dev`. Domains are declared in `src/domains.js`;
+the proxy is configured in `vite.config.js` (keep the two in sync).
+
+**CORS on the service.** Direct mode needs the service to allow the page's origin. In the service's `application.yml`:
+`query-engine.cors.enabled` is the switch and `query-engine.cors.allowed-origins` lists the origins (exact scheme, host and port;
+the dev defaults are `http://localhost:5173` and `http://127.0.0.1:5173`). CORS is off when `enabled` is `false` or the list is empty;
+the service then sends no CORS headers, and a page on another origin cannot read its responses. Same-origin pages, proxy mode and
+non-browser callers are never affected. Environment overrides: `QE_CORS_ENABLED`, `QE_CORS_ALLOWED_ORIGINS`. `order-query` ships with
+CORS off (`enabled: false`), `inventory-query` with it on.
+
+**When a direct call fails** the page says which of two things happened. If the service answers a request the browser would not let
+the page read, you get "Blocked by the browser (CORS)" with the two ways out: turn CORS on in the service, or start the UI in proxy
+mode for that domain. If nothing answers at all, you get "Can't reach ...". The page tells them apart by retrying with a `no-cors`
+request, which is allowed to complete without being readable. Every direct POST sends a preflight `OPTIONS` first (the JSON body and
+the `X-Roles` / `X-Author` headers require it); when CORS is on, the service lets the browser cache that for 30 minutes.
+
+The dev server also serves `GET /__dev/stats` (container CPU and memory for the Downstream demo), which only exists under `npm run dev`.
 
 ## Running
 

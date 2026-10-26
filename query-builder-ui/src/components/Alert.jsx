@@ -26,6 +26,8 @@ export default function Alert({ variant = 'info', title, children, actions, clas
 // Plain titles for engine codes whose raw name would mean little to someone using the UI.
 const CODE_TITLES = {
   SQL_REJECTED: 'Not a read-only SELECT',
+  SQL_INVALID: 'The SQL is invalid',
+  CORS_BLOCKED: 'Blocked by the browser (CORS)',
 }
 
 /** Renders an EngineError (or any Error) with its engine code as the title. */

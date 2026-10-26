@@ -22,6 +22,7 @@ export const CLIENT_ERRORS = {
   SERVICE_UNREACHABLE: 'SERVICE_UNREACHABLE',
   SERVICE_ERROR: 'SERVICE_ERROR',
   BAD_RESPONSE: 'BAD_RESPONSE',
+  CORS_BLOCKED: 'CORS_BLOCKED',
 }
 
 export function isAbortError(err) {
@@ -43,7 +44,18 @@ function parseJson(text) {
   }
 }
 
-export function createEngineClient({ baseUrl, serviceLabel }) {
+/** How long to wait when checking whether a service that failed a call is there at all. */
+const PROBE_TIMEOUT_MS = 3000
+
+/**
+ * @param baseUrl      what the browser calls: the service's address (direct) or a dev-server path prefix (proxy)
+ * @param serviceLabel name shown in messages
+ * @param serviceUrl   the service's real address, for messages (defaults to baseUrl)
+ * @param modeVar      the variable that switches this domain to proxy mode, for the CORS hint
+ */
+export function createEngineClient({ baseUrl, serviceLabel, serviceUrl = baseUrl, modeVar = 'VITE_<DOMAIN>_QUERY_MODE' }) {
+  const viaProxy = baseUrl.startsWith('/')
+
   /** Builds the EngineError for a non-2xx response from its parsed body. */
   function errorFromResponse(status, parsed) {
     if (isEngineErrorBody(parsed)) {
@@ -55,27 +67,68 @@ export function createEngineClient({ baseUrl, serviceLabel }) {
         body: parsed,
       })
     }
-    // No engine error body. An empty 5xx is the dev-server proxy saying it couldn't connect
-    // (502); anything else came from the framework rather than the engine's error handling.
-    const proxyFailure = status >= 500 && (parsed === null || parsed === undefined)
+    // No engine error body: the response came from the framework or something in front of the
+    // service rather than from the engine's own error handling. Through the dev-server proxy, an
+    // empty 5xx is the proxy saying it could not connect to the service.
+    const proxyFailure = viaProxy && status >= 500 && (parsed === null || parsed === undefined)
+    if (proxyFailure) {
+      return new EngineError({
+        status,
+        code: CLIENT_ERRORS.SERVICE_UNREACHABLE,
+        message: `Can't reach ${serviceLabel} through the dev server (${baseUrl} -> ${serviceUrl}). Check that the service is running (./dry-run.sh).`,
+      })
+    }
     const detail = parsed && typeof parsed === 'object' ? parsed.message || parsed.error : null
     let message
-    if (proxyFailure) message = `Can't reach ${serviceLabel}. Check that the service is running (./dry-run.sh).`
-    else if (status < 500) message = `${serviceLabel} rejected the request (HTTP ${status})${detail ? `: ${detail}` : '.'}`
+    if (status < 500) message = `${serviceLabel} rejected the request (HTTP ${status})${detail ? `: ${detail}` : '.'}`
     else message = `${serviceLabel} failed to handle the request (HTTP ${status}). Check the service logs.`
     return new EngineError({
       status,
-      code: proxyFailure ? CLIENT_ERRORS.SERVICE_UNREACHABLE : CLIENT_ERRORS.SERVICE_ERROR,
+      code: CLIENT_ERRORS.SERVICE_ERROR,
       message,
       body: parsed ?? null,
     })
   }
 
-  function unreachable() {
+  /**
+   * A failed fetch looks the same whether the service is down or the browser refused the response for
+   * lack of CORS permission, and a script cannot tell which. So ask again with mode 'no-cors': that
+   * request is allowed to complete without being readable, and completing means something is listening.
+   */
+  async function unreachable() {
+    if (viaProxy) {
+      return new EngineError({
+        status: 0,
+        code: CLIENT_ERRORS.SERVICE_UNREACHABLE,
+        message: `Can't reach ${serviceLabel} through the dev server (${baseUrl} -> ${serviceUrl}). Check that the service is running (./dry-run.sh).`,
+      })
+    }
+    const origin = globalThis.location?.origin ?? 'this page'
+    let listening = false
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS)
+    try {
+      await fetch(`${baseUrl}/query-roles`, { mode: 'no-cors', cache: 'no-store', signal: controller.signal })
+      listening = true
+    } catch {
+      listening = false
+    } finally {
+      clearTimeout(timer)
+    }
+    if (listening) {
+      return new EngineError({
+        status: 0,
+        code: CLIENT_ERRORS.CORS_BLOCKED,
+        message:
+          `${serviceLabel} is running at ${baseUrl}, but it does not allow requests from this page (${origin}). ` +
+          `Either turn CORS on in the service (query-engine.cors.enabled: true, with ${origin} in query-engine.cors.allowed-origins), ` +
+          `or start the UI with ${modeVar}=proxy so this domain goes through the dev server.`,
+      })
+    }
     return new EngineError({
       status: 0,
       code: CLIENT_ERRORS.SERVICE_UNREACHABLE,
-      message: `Can't reach ${serviceLabel}. Check that the service is running (./dry-run.sh).`,
+      message: `Can't reach ${serviceLabel} at ${baseUrl}. Check that the service is running (./dry-run.sh).`,
     })
   }
 
@@ -90,7 +143,7 @@ export function createEngineClient({ baseUrl, serviceLabel }) {
       })
     } catch (err) {
       if (isAbortError(err)) throw err
-      throw unreachable()
+      throw await unreachable()
     }
 
     const text = await res.text()
@@ -151,7 +204,7 @@ export function createEngineClient({ baseUrl, serviceLabel }) {
         })
       } catch (err) {
         if (isAbortError(err)) throw err
-        throw unreachable()
+        throw await unreachable()
       }
       if (!res.ok) throw errorFromResponse(res.status, parseJson(await res.text()))
       if (!res.body) throw new EngineError({ status: res.status, code: CLIENT_ERRORS.BAD_RESPONSE, message: 'This browser cannot stream response bodies.' })

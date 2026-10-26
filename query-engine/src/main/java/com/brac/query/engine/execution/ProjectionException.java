@@ -44,6 +44,22 @@ public class ProjectionException extends RuntimeException {
     }
 
     /**
+     * True when Postgres rejected the SQL text itself: a syntax error, an unknown table, column or
+     * function, a type mismatch, or a constant expression that cannot be evaluated (SQLSTATE classes
+     * 42, 22 and 0A). The author can fix these, as opposed to a failure of the database or the
+     * connection.
+     */
+    public boolean invalidSql() {
+        return kind == Kind.FAILED && sqlState != null
+                && (sqlState.startsWith("42") || sqlState.startsWith("22") || sqlState.startsWith("0A"));
+    }
+
+    /** The one-line message shown to the author for invalid SQL, with the database's own wording. */
+    public String invalidSqlMessage() {
+        return "PostgreSQL rejected the SQL: " + (detail != null ? detail : "unknown error") + " (SQLSTATE " + sqlState + ")";
+    }
+
+    /**
      * @param exposeDetail include the database's own message (authoring calls) or only the SQLSTATE
      *                     (runtime calls)
      */
@@ -53,7 +69,9 @@ public class ProjectionException extends RuntimeException {
                     "The query was cancelled because it ran longer than the database statement timeout.");
             case BUSY -> new EngineException("SERVICE_BUSY", HttpStatus.SERVICE_UNAVAILABLE, queryName,
                     "No database connection was available in time. Try again shortly.");
-            case FAILED -> new EngineException("QUERY_EXECUTION_FAILED", HttpStatus.INTERNAL_SERVER_ERROR, queryName,
+            case FAILED -> exposeDetail && invalidSql()
+                    ? new EngineException("SQL_INVALID", HttpStatus.UNPROCESSABLE_ENTITY, queryName, invalidSqlMessage())
+                    : new EngineException("QUERY_EXECUTION_FAILED", HttpStatus.INTERNAL_SERVER_ERROR, queryName,
                     "The query could not be executed"
                             + (sqlState != null ? " (SQLSTATE " + sqlState + ")" : "")
                             + (exposeDetail && detail != null ? ": " + detail : ".")

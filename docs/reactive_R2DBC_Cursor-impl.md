@@ -258,9 +258,10 @@ releases the connection, which is itself part of the demonstration. In developme
 the first request is aborted at once and shows up as one `cancelled` line in the service log.
 
 **Plumbing.** `engineClient.js` gains a `stream(...)` function that reuses the existing error normalization before the
-body is read, so a `403`, `404` or `503` appears as a normal error on the page. The dev-server proxy (`vite.config.js`)
-needs no change but must not buffer the response; the spike checks that. A built `dist/` served by a reverse proxy would
-need response buffering switched off (`proxy_buffering off` in nginx).
+body is read, so a `403`, `404` or `503` appears as a normal error on the page. The browser now calls the service
+directly (the dev-server proxy was removed, see `PROGRESS.md`, "Direct service calls"), so nothing in between buffers the
+response. A built `dist/` served behind a reverse proxy would need response buffering switched off (`proxy_buffering off`
+in nginx).
 
 Memory-limited review run: a compose override file, `order-query/docker/docker-compose.lowmem.yml`, sets
 `JAVA_TOOL_OPTIONS=-Xmx192m` and a container memory limit for the service, so a flat footprint during the 70 MB stream is
@@ -580,8 +581,8 @@ pressure during a stream.
 
 A web page cannot read another process's CPU or memory. The numbers that matter live in the `order-query-app` and
 `order-query-postgres` containers, so something on the developer's machine has to ask Docker. The Vite dev server already runs
-there and already sits between the browser and the services (it proxies `/api/order` and `/api/inventory`), so it also
-serves one extra path, `/__dev/stats`.
+there, so it serves one extra path, `/__dev/stats`. (It used to proxy the services as well; since the proxy was removed the
+browser calls the services directly and the dev server's only job here is this endpoint.)
 
 ```mermaid
 flowchart LR
@@ -589,9 +590,8 @@ flowchart LR
     V -- "long-lived child process" --> D["docker stats --format '{{json .}}'"]
     D --> C1[order-query-app]
     D --> C2[order-query-postgres]
-    B -- "/api/order/data-query (the stream)" --> V
-    V -- proxy --> C1
-    B -- "/api/order/query-roles every 2 s (availability)" --> V
+    B -- "http://localhost:8081/data-query (the stream, direct)" --> C1
+    B -- "http://localhost:8081/query-roles every 2 s (availability, direct)" --> C1
 ```
 
 ### 11.2 The `/__dev/stats` endpoint (Vite plugin)
@@ -667,7 +667,7 @@ Layout, top to bottom:
 3. **Check it from outside.** Copyable commands: how the last stream ended (`docker logs ... | grep "data-query query"`) and
    the Postgres connection state.
 
-Service availability calls `GET /query-roles` every 2 s through the same client and proxy. It is a cheap call served from the
+Service availability calls `GET /query-roles` every 2 s through the same client, straight to the service. It is a cheap call served from the
 service's main pool, not the streaming pool, so it answers the question "does the service stay responsive while a stream is
 running?". Up under 1 s, Slow above 1 s, Not answering after a failed call (with the error and the count of consecutive
 failures). The last 30 results are drawn as small bars.

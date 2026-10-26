@@ -94,15 +94,41 @@ public class QueryEngineService {
 
             return lockCheck.then(Mono.defer(() -> {
                 QueryEntry entry = new QueryEntry(request.sql(), request.params(), request.allowedRoles(), request.fetchSize());
-                var validationResult = validator.validate(entry);
-                DraftStatus status = validationResult.hasErrors() ? DraftStatus.DRAFT : DraftStatus.VALIDATED;
-
-                DraftRecord record = new DraftRecord(
-                        queryName, entry, validationResult.validatedQuery(), status,
-                        validationResult.errors(), false, author, now
-                );
-                return draftStore.save(record).thenReturn(toDraftResponse(record));
+                return withDatabaseCheck(queryName, validator.validate(entry)).flatMap(checked -> {
+                    var validationResult = checked.result();
+                    DraftStatus status = validationResult.hasErrors() ? DraftStatus.DRAFT : DraftStatus.VALIDATED;
+                    DraftRecord record = new DraftRecord(
+                            queryName, entry, validationResult.validatedQuery(), status,
+                            validationResult.errors(), false, author, now
+                    );
+                    return draftStore.save(record).thenReturn(toDraftResponse(record).withWarnings(checked.warnings()));
+                });
             }));
+        });
+    }
+
+    /** The validation result, plus notes about checks that could not be made. */
+    private record Checked(QueryValidator.ValidationResult result, List<ValidationError> warnings) {
+    }
+
+    /**
+     * When the checks that need no database pass, asks Postgres whether it accepts the SQL (see
+     * {@link ProjectionStoreExecutor#check}). A rejection becomes a {@code SQL_INVALID} error, so
+     * the draft is stored as {@code DRAFT} and cannot be simulated or published until it is fixed.
+     * If the database could not be asked, the draft is stored as it is and the response carries an
+     * {@code SQL_NOT_CHECKED} warning, so the author is not told the SQL was checked when it was not.
+     */
+    private Mono<Checked> withDatabaseCheck(String queryName, QueryValidator.ValidationResult result) {
+        if (result.hasErrors()) {
+            return Mono.just(new Checked(result, List.of()));
+        }
+        return executor.check(queryName, result.validatedQuery()).map(check -> switch (check.outcome()) {
+            case ACCEPTED -> new Checked(result, List.of());
+            case REJECTED -> new Checked(new QueryValidator.ValidationResult(null, result.params(),
+                    List.of(new ValidationError("SQL_INVALID", null, check.problem().invalidSqlMessage()))), List.of());
+            case UNAVAILABLE -> new Checked(result, List.of(new ValidationError("SQL_NOT_CHECKED", null,
+                    "The database could not check this SQL just now, so it was saved without that check. A syntax error or an "
+                            + "unknown table or column will only show when you simulate.")));
         });
     }
 
@@ -340,7 +366,7 @@ public class QueryEngineService {
                 record.queryName(), record.status().name(), record.validatedQuery(),
                 record.errors(),
                 new DraftResponse.Entry(record.entry().sql(), record.entry().params(), record.entry().fetchSize()),
-                record.simulated());
+                record.simulated(), List.of());
     }
 
     private boolean matchesFilter(String queryName, PublishedQuery published, DraftRecord draft, ListRequest.Filter filter) {

@@ -39,7 +39,7 @@ export default function DefinitionProblems({ checks }) {
   if (!checks) return null
 
   if (checks.problems.length === 0) {
-    return <p className="text-xs text-emerald-700">The definition looks valid: one read-only SELECT, params declared and used.</p>
+    return <p className="text-xs text-emerald-700">No structural problems: one read-only SELECT, params declared and used. This check cannot see whether the SQL itself is valid; the database checks that when you save.</p>
   }
 
   return (

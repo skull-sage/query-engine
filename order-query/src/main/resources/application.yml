@@ -38,3 +38,11 @@ query-engine:
     # Schemas that hold this domain's projection tables. The reader finds unqualified table names here and
     # the service login may write them.
     projection-schemas: public
+  # Cross-origin (CORS) access for browser pages such as the Query Builder UI (vite dev server, port 5173), which
+  # calls this service directly. `enabled` is the switch; `allowed-origins` (comma separated, exact scheme, host and
+  # port) is who may call. CORS is off when `enabled` is false or the list is empty: the service then sends no CORS
+  # headers and a page on another origin cannot read its responses. Same-origin pages, the UI's proxy mode and
+  # non-browser callers (curl, other services) are never affected. Overrides: QE_CORS_ENABLED, QE_CORS_ALLOWED_ORIGINS.
+  cors:
+    enabled: "${QE_CORS_ENABLED:true}"
+    allowed-origins: "${QE_CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}"

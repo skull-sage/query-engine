@@ -97,6 +97,46 @@ public class ProjectionStoreExecutor {
         });
     }
 
+    /**
+     * Asks Postgres whether it accepts the SQL, without running it: the statement is planned with
+     * {@code EXPLAIN} (no {@code ANALYZE}), so no rows are read, but syntax errors, unknown tables
+     * and columns, unknown functions and type mismatches are all reported. Params are bound with a
+     * neutral sample value of their declared type, so a type that does not fit the SQL (a String
+     * compared with an integer column, say) is reported too, exactly as a real run would.
+     *
+     * <p>The result is tri-state: accepted, rejected (with the database's reason), or unavailable
+     * (the database was busy, timed out or could not be reached, so nothing is known). Unavailable
+     * must not make a draft look invalid, but it must not look checked either; the caller says so.
+     */
+    public Mono<CheckResult> check(String queryName, ValidatedQuery query) {
+        return Mono.defer(() -> {
+            DatabaseClient.GenericExecuteSpec spec = projection.client().sql("EXPLAIN " + query.sql());
+            for (ParamSpec paramSpec : query.params()) {
+                spec = spec.bind(paramSpec.name(), sampleValue(paramSpec.type()));
+            }
+            return projection.inReadOnlyTransaction(spec.fetch().all()).then(Mono.just(CheckResult.accepted()));
+        }).onErrorResume(error -> {
+            Throwable translated = translate(error);
+            if (translated instanceof ProjectionException problem && problem.invalidSql()) {
+                return Mono.just(CheckResult.rejected(problem));
+            }
+            log.warn("Could not check the SQL of '{}' against the database, so it is saved unchecked: {}", queryName, translated.getMessage());
+            return Mono.just(CheckResult.unavailable());
+        });
+    }
+
+    private static Object sampleValue(ParamType type) {
+        return switch (type) {
+            case STRING -> "";
+            case INT -> 0;
+            case LONG -> 0L;
+            case DECIMAL -> java.math.BigDecimal.ZERO;
+            case BOOLEAN -> false;
+            case DATE -> LocalDate.EPOCH;
+            case DATETIME -> OffsetDateTime.ofInstant(Instant.EPOCH, ZoneOffset.UTC);
+        };
+    }
+
     /** Converts a declared, typed argument into a value the R2DBC driver can bind directly. */
     private Object coerce(String queryName, ParamSpec spec, Object raw) {
         if (raw == null) {
@@ -167,6 +207,23 @@ public class ProjectionStoreExecutor {
         }
         log.warn("Projection query failed (SQLSTATE {}): {}", sqlState, detail);
         return new ProjectionException(ProjectionException.Kind.FAILED, sqlState, detail, ex);
+    }
+
+    /** What {@link #check} found out about a query's SQL. */
+    public record CheckResult(Outcome outcome, ProjectionException problem) {
+        public enum Outcome { ACCEPTED, REJECTED, UNAVAILABLE }
+
+        static CheckResult accepted() {
+            return new CheckResult(Outcome.ACCEPTED, null);
+        }
+
+        static CheckResult rejected(ProjectionException problem) {
+            return new CheckResult(Outcome.REJECTED, problem);
+        }
+
+        static CheckResult unavailable() {
+            return new CheckResult(Outcome.UNAVAILABLE, null);
+        }
     }
 
     /** A bounded read: at most the requested rows, whether more existed, and how long it took. */

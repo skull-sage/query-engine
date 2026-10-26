@@ -15,6 +15,7 @@ import DefinitionProblems, { ProblemList, problemCount } from './DefinitionProbl
 export default function DraftStep({ state, derived, definition, onYamlChange, nameWarning }) {
   const { draft, stale, notice, draftError, draftBusy } = state
   const params = draft?.validatedQuery?.params || []
+  const warnings = draft?.warnings || []
 
   // After a save the server has the last word: show its list instead of the live one when it stored the draft
   // as invalid and the editor still matches what was saved.
@@ -72,7 +73,17 @@ export default function DraftStep({ state, derived, definition, onYamlChange, na
         </div>
       )}
 
-      {draft && !derived.dirty && derived.validated && (
+      {draft && !derived.dirty && derived.validated && warnings.length > 0 && (
+        <Alert variant="warning" title="Draft saved, but the SQL was not checked against the database">
+          <ul className="list-disc space-y-0.5 pl-5">
+            {warnings.map((w, i) => (
+              <li key={`${w.code}-${i}`}>{w.message}</li>
+            ))}
+          </ul>
+        </Alert>
+      )}
+
+      {draft && !derived.dirty && derived.validated && warnings.length === 0 && (
         <Alert variant="success" title="Draft saved and validated">
           {params.length === 0 ? (
             'This query takes no params.'

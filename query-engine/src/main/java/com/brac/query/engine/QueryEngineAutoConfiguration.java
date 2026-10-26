@@ -1,5 +1,6 @@
 package com.brac.query.engine;
 
+import com.brac.query.engine.config.CorsProperties;
 import com.brac.query.engine.config.EngineStoreProperties;
 import com.brac.query.engine.config.ProjectionPoolProperties;
 import com.brac.query.engine.config.SecurityProperties;
@@ -8,18 +9,25 @@ import com.brac.query.engine.config.SqlGuardProperties;
 import com.brac.query.engine.config.StreamProperties;
 import com.brac.query.engine.execution.ProjectionDatabase;
 import com.brac.query.engine.store.EngineDatabase;
+import com.brac.query.engine.web.EngineCors;
 import io.r2dbc.spi.Connection;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.ApplicationListener;
 import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.ComponentScan;
+import org.springframework.core.Ordered;
+import org.springframework.core.annotation.Order;
 import org.springframework.core.env.Environment;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.r2dbc.connection.init.ConnectionFactoryInitializer;
 import org.springframework.r2dbc.connection.init.DatabasePopulator;
 import org.springframework.r2dbc.connection.init.ResourceDatabasePopulator;
 import reactor.core.publisher.Flux;
+import org.springframework.web.server.WebFilter;
 import reactor.core.publisher.Mono;
 
 /**
@@ -39,11 +47,30 @@ import reactor.core.publisher.Mono;
 @AutoConfiguration
 @ComponentScan(basePackageClasses = QueryEngineAutoConfiguration.class)
 @EnableConfigurationProperties({StreamProperties.class, ProjectionPoolProperties.class, SimulateProperties.class,
-        EngineStoreProperties.class, SqlGuardProperties.class, SecurityProperties.class})
+        EngineStoreProperties.class, SqlGuardProperties.class, SecurityProperties.class, CorsProperties.class})
 public class QueryEngineAutoConfiguration {
 
     /** Classpath location of the engine's DDL + identity catalog seed. */
     public static final String SCHEMA_LOCATION = "query-engine/schema.sql";
+
+    /**
+     * Lets the listed browser origins call the engine directly (the Query Builder UI calls it
+     * without a proxy). On only when {@code query-engine.cors.enabled} is true (the default) and
+     * {@code query-engine.cors.allowed-origins} lists at least one origin; otherwise this is a
+     * pass-through and the service does no CORS handling at all. First in the filter chain, so
+     * preflights are answered before anything else and error responses carry the CORS headers too.
+     */
+    @Bean
+    @Order(Ordered.HIGHEST_PRECEDENCE)
+    public WebFilter queryEngineCorsFilter(CorsProperties cors) {
+        return EngineCors.create(cors);
+    }
+
+    /** Says in the startup log whether browser pages on other origins can use this service. */
+    @Bean
+    public ApplicationListener<ApplicationReadyEvent> queryEngineCorsStatus(CorsProperties cors) {
+        return event -> LoggerFactory.getLogger(EngineCors.class).info(EngineCors.describe(cors));
+    }
 
     /**
      * The pool for the engine's own tables, separate from the service's pool. See

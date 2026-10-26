@@ -1,6 +1,6 @@
 # Query Engine — Progress / Resume Notes
 
-Last updated: 2026-10-25. Snapshot of what's been built so we can pick up later. The `/data-query` backpressure work is
+Last updated: 2026-10-26. Snapshot of what's been built so we can pick up later. The `/data-query` backpressure work is
 implemented; see "Backpressure for /data-query". The security protocol (separate schema and logins, read-only queries,
 SQL lexer) is built; see "Security protocol".
 
@@ -96,7 +96,7 @@ docker compose -f inventory-query/docker/docker-compose.yml up -d --build --wait
   publish without roles → 422, publish → invoke WH-CTG/LOW_STOCK → 2 rows.
 - Isolation: an Order query name on inventory-query → 404; each service lists only its own queries.
 - Restarting a service container keeps its drafts and published queries.
-- UI: production build passes; dev-server proxy reaches both services; a stopped service surfaces as `SERVICE_UNREACHABLE`.
+- UI: production build passes; (originally via the dev-server proxy, now direct, see "Direct service calls") a stopped service surfaces as `SERVICE_UNREACHABLE`.
   The dialogs themselves have not been exercised in a browser yet.
 
 ## Backpressure for /data-query (implemented)
@@ -210,6 +210,88 @@ Full design, DDL, rules and what was checked: `docs/security_protocol.md`. It re
 - **Known trade-offs:** `pg_read_all_data` lets the reader see `query_engine` when the lexer is off (the lexer rejects
   `query_engine.`); a column literally named `insert` / `update` / `delete` / `merge` must be quoted; a write that reaches
   the database comes back as `500 QUERY_EXECUTION_FAILED` (SQLSTATE 25006), not a dedicated code.
+
+## Direct service calls (2026-10-26)
+- The Vite dev-server proxy (`/api/order`, `/api/inventory`) is removed. The browser calls `order-query` (8081) and
+  `inventory-query` (8082) directly, so each request and response to a service origin can be inspected, blocked, overridden
+  or given breakpoints in the browser's DevTools. The UI's domain descriptor (`src/domains.js`) now carries only `serviceUrl`
+  (no `apiBase`); override with `VITE_ORDER_QUERY_URL` / `VITE_INVENTORY_QUERY_URL` when the dev server starts.
+- Cross-origin now, so the services answer CORS: new `query-engine.cors.allowed-origins` (library: `CorsProperties`,
+  `web/EngineCors`, a `CorsWebFilter` first in the chain, only present when the property is set; empty means no browser
+  origin is allowed). Dev defaults in both `application.yml`: `http://localhost:5173` and `http://127.0.0.1:5173`
+  (`QE_CORS_ALLOWED_ORIGINS` overrides). Methods GET, POST, OPTIONS; headers Content-Type, Accept, X-Author, X-Roles; no
+  credentials; `Retry-After` exposed; preflight cached 30 min. `*` is accepted but logged as a warning. There is still no
+  authentication, so the origin list is the only browser-side control.
+- `/__dev/stats` stays on the dev server (it is not a service proxy).
+- Verified: unit tests (`EngineCorsTest`, 5 cases; 128 backend tests and 121 UI tests pass); `curl` preflights (allowed origin
+  gets the headers, another origin gets 403, an error response from the service still carries the header); real headless Chrome
+  with the Network domain on: every service call goes to `localhost:8081` / `8082` with one preflight per endpoint, the
+  Downstream demo delivered all 50,000 rows in order, the inventory list loads, and with order-query stopped the page shows "Not
+  answering".
+- Not verified: the UI's "Can't reach ... allows this page's origin" message against a real CORS refusal in a browser (only the
+  server's 403 was checked), and an aborted stream seen from a browser through a direct connection. The earlier halt defect where the
+  Vite proxy hid a service abort should be gone with the proxy, but that has not been re-tested in a browser.
+- Trade-offs: a production deployment must list its UI origin(s); the UI shows one generic "Can't reach" message for a refused
+  connection and for a CORS refusal because the browser does not tell scripts which it was.
+
+## Invalid SQL is now reported at draft and simulate (2026-10-26)
+- Problem: the lexer only checks that the text is a single read-only SELECT, so `SELECT * FORM t`, a missing column or a type
+  mismatch was saved as `VALIDATED`, and only simulate failed, as a generic `500 QUERY_EXECUTION_FAILED`.
+- Draft: after the lexer and param checks pass, `ProjectionStoreExecutor.check` runs `EXPLAIN <sql>` (planned, never executed)
+  in the read-only transaction, binding each param with a neutral sample of its declared type. A Postgres rejection (SQLSTATE
+  class 42, 22 or 0A) becomes error `SQL_INVALID` with Postgres's wording, so the draft is stored as `DRAFT` and Simulate and
+  Publish stay locked. If the database is busy or unreachable the draft is saved unchecked (logged), never marked invalid.
+- Simulate: a database rejection of the SQL (for example a division by zero that only happens on real rows, which `EXPLAIN` cannot
+  see) is now `422 SQL_INVALID` with the database message, instead of `500`. `/data-query` still answers `500
+  QUERY_EXECUTION_FAILED` without database wording.
+- UI: the draft step shows "Saved, but the query definition is invalid" with the `SQL_INVALID` line; the simulate step shows
+  "The SQL is invalid" with the message and a hint to go back to the Draft step.
+- Verified: 14 SQL cases against order-query (10 invalid ones now `DRAFT` with `SQL_INVALID`; 4 valid ones, including a window
+  function, a CTE and a trailing `;`, still `VALIDATED` and simulate fine); `ProjectionExceptionTest` (3 cases); in headless
+  Chrome, a syntax error shows the invalid-draft panel with the Postgres message and locks Simulate, and a draft that only fails on
+  data shows "The SQL is invalid" in the simulate step. Also seen in Chrome: with the CORS origin list empty the page shows "Can't
+  reach ... allows this page's origin".
+- Limits: `EXPLAIN` only plans, so errors that depend on row data surface at simulate; the planner folds constant expressions, so
+  `SELECT 1/0` is caught at draft. Each draft now costs one extra planning round trip. A draft that is edited into a valid state
+  is rechecked on every save.
+- Follow-up (2026-10-26, report "SELECT FROM projection WHERE is still accepted, no UI error"): on a current build both services reject
+  it (checked on 8081 and 8082, through `/engine/draft` and `/engine/draft-yml`, and in Chrome in the wizard): status `DRAFT`, error
+  `SQL_INVALID: syntax error at end of input`, Simulate locked. Two ways it could still look accepted, both now addressed:
+  1. If the database cannot be asked (reader login cannot connect, pool busy), the draft used to be saved as `VALIDATED` with only a
+     server log line, and the UI said "Draft saved and validated". The response now carries `warnings: [SQL_NOT_CHECKED]` and the
+     draft step shows an amber "Draft saved, but the SQL was not checked against the database". Reproduced by setting the reader role
+     `NOLOGIN`; the draft then saves `VALIDATED` with the warning, and simulate shows the real connection error.
+  2. The live panel under the editor said "The definition looks valid" for any single SELECT, including broken SQL. It now says there
+     are no structural problems and that the database checks the SQL when you save. The live panel still cannot find syntax errors;
+     only the save does.
+  3. A service started from an older build (a container not rebuilt, or `bootRun` against an old `mavenLocal` engine jar) has only the
+     lexer and does accept such SQL. `./dry-run.sh` republishes the engine and rebuilds the images; for `bootRun`, run
+     `cd query-engine && ./gradlew publishToMavenLocal` first.
+- Note: `order-query/src/main/resources/application.yml` currently has `cors.allowed-origins: "${QE_CORS_ALLOWED_ORIGINS:}"`
+  (empty default, edited outside this session). An empty list installs the CORS filter with no allowed origin, so the UI cannot
+  reach the service until `QE_CORS_ALLOWED_ORIGINS=http://localhost:5173` is set.
+
+## Cross-origin switch and proxy mode (2026-10-26)
+- Backend: `query-engine.cors.enabled` (default true) is now an explicit switch next to `allowed-origins`. CORS is on only when
+  it is true and at least one origin is listed; otherwise the filter is a pass-through and the service does no CORS handling
+  (no headers, no 403), and startup logs one line saying which. `order-query` ships `enabled: "${QE_CORS_ENABLED:false}"`
+  (off, as you had it, but now by the switch, with the origin list kept in the file); `inventory-query` ships it on.
+  Overrides `QE_CORS_ENABLED`, `QE_CORS_ALLOWED_ORIGINS`.
+- Frontend: a domain can be switched to proxy mode when the dev server starts: `VITE_ORDER_QUERY_MODE=proxy` or
+  `VITE_INVENTORY_QUERY_MODE=proxy` (one domain at a time). The dev proxy exists only for those domains, with abort propagation
+  so a service-side abort reaches the browser. Default stays direct. `src/domains.js` now carries `apiBase` (what the browser
+  calls), `serviceUrl` (the real address), `connection` and `modeVar` again.
+- Frontend error message: when a direct call fails, the client retries with `mode: 'no-cors'`. If that completes, the service is
+  running but refuses this origin: code `CORS_BLOCKED`, title "Blocked by the browser (CORS)", with both fixes spelled out (turn
+  CORS on in the service, or start the UI in proxy mode). If it fails too, `SERVICE_UNREACHABLE` as before. In proxy mode an empty 5xx
+  from the proxy is "Can't reach ... through the dev server".
+- Verified: backend unit tests (`EngineCorsTest` now 7 cases) and `engineClient.test.js` (7 cases); all 128 UI tests pass. Live, in
+  headless Chrome: default run, order shows the CORS_BLOCKED message while inventory loads; order started in proxy mode loads through
+  `/api/order` (no `:8081` call from the browser, availability Up) while inventory stays direct; with order-query stopped in proxy
+  mode the page says "Can't reach ... through the dev server". Startup log shows "CORS is off ..." for order-query and "CORS is on for
+  [...]" for inventory-query.
+- Not verified: streaming through proxy mode, and the abort propagation hook (written, not exercised); `dry-run.sh` with the variable
+  exported was not run end to end (the dev server was started by hand with the variable).
 
 ## Possible next steps
 

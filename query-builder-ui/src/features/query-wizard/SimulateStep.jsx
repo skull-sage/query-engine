@@ -34,6 +34,9 @@ export default function SimulateStep({ state, onParamsChange, onSimulate }) {
       </section>
 
       <ErrorAlert error={simulateError} title={simulateError?.code === 'INVALID_ARGUMENT' ? 'Check the params' : undefined} />
+      {simulateError?.code === 'SQL_INVALID' && (
+        <p className="text-xs text-slate-600">The database could not run this SQL, so it cannot be published. Go back to the Draft step, fix it and save again.</p>
+      )}
 
       {result && (
         <section aria-labelledby="simulate-result-heading" className={`space-y-3 transition-opacity ${simulateBusy ? 'opacity-50' : ''}`}>

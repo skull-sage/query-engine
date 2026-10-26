@@ -10,7 +10,13 @@ const DomainContext = createContext(null)
  */
 export function DomainProvider({ domain, children }) {
   const client = useMemo(
-    () => createEngineClient({ baseUrl: domain.apiBase, serviceLabel: `${domain.label} (${domain.service})` }),
+    () =>
+      createEngineClient({
+        baseUrl: domain.apiBase,
+        serviceLabel: `${domain.label} (${domain.service})`,
+        serviceUrl: domain.serviceUrl,
+        modeVar: domain.modeVar,
+      }),
     [domain],
   )
   const value = useMemo(() => ({ domain, client }), [domain, client])
