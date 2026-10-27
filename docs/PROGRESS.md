@@ -181,6 +181,15 @@ the findings do not depend on the row count). Full detail is in `docs/reactive_R
 - Verified live on order-query: draft, lock (409 with the new message), simulate, list, a draft backdated 60 days still found
   and publishable, and the old column dropped on restart. UI list and wizard no longer show "expires".
 
+## Author-SQL pool limited to 4 (2026-10-27)
+- `query-engine.projection.max-size` is now **4** (default in `DBProjectionPoolProperties`, and written out in both `application.yml`
+  files as `${QE_PROJECTION_MAX_SIZE:4}`, with `initial-size` 2). To be revisited. Measured with 6 slow readers on `order-query`: 4 streams
+  ran, 2 answered `503 SERVICE_BUSY` after 6 s, the author-SQL pool held exactly 4 connections, and `/engine/list` stayed at 5 to 7 ms
+  because storing and listing use the service's own pool.
+- Consequence to remember: simulate and the draft-time `EXPLAIN` check use the same 4 connections, so while 4 streams are open a
+  draft waits about 6 s and is saved without the database check (`SQL_NOT_CHECKED`), and simulate answers `503`. The earlier idea of
+  keeping connections free for them (cap streams below the pool size) is still open.
+
 ## Security protocol (revised 2026-10-27)
 Full design, rules, trade-offs and what was checked: `docs/security_protocol.md`. The three-login design built on 2026-10-25
 (`query_engine_owner`, `query_engine_ro`, a `query_engine` schema, `./gradlew provision`) was replaced by "One datasource, one

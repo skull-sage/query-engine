@@ -47,11 +47,14 @@ query-engine:
   # if set, REPLACES the built-in list (an entry ending in * matches every name starting with it).
   #sql-guard:
   #  enabled: true
-  # The pool that runs author SQL, same datasource as above. Size it for the number of streams you expect to run at
-  # once: each open stream holds one connection until its client has read everything.
-  #projection:
-  #  initial-size: 2
-  #  max-size: 20
+  # The pool that runs author SQL, same datasource as above. Every open stream holds one connection until its client has
+  # read everything, and simulate and the draft-time SQL check use this pool too, so max-size is also the number of
+  # streams that can run at once: with all connections taken, a new stream answers 503 SERVICE_BUSY after acquire-timeout
+  # and a draft is saved without the database check. 4 is deliberately small for now and is to be revisited. The service's
+  # own pool (spring.r2dbc.pool above) is separate, so storing, listing and looking up queries are not held up by streams.
+  projection:
+    initial-size: "${QE_PROJECTION_INITIAL_SIZE:2}"
+    max-size: "${QE_PROJECTION_MAX_SIZE:4}"
   # Limits on /data-query. fetch-size is the default number of rows read from Postgres per round trip (a query can
   # set its own). json-max-rows caps a plain application/json answer (bigger results must stream as NDJSON).
   # stall-timeout ends a stream whose client stops reading, max-duration caps any stream, acquire-timeout is how long

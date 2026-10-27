@@ -15,7 +15,7 @@ import java.time.Duration;
 @ConfigurationProperties(prefix = "query-engine.projection")
 public record DBProjectionPoolProperties(
         @DefaultValue("2") int initialSize,
-        @DefaultValue("20") int maxSize,
+        @DefaultValue("4") int maxSize,
         @DefaultValue("30m") Duration maxIdleTime
 ) {
 }
