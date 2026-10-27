@@ -1,84 +1,30 @@
--- Storage owned by query-engine, created on startup of every service that embeds it (see
--- QueryEngineAutoConfiguration). Each domain query service points query-engine at its own
--- database, so every domain gets its own drafts, published queries and identity catalog,
--- separate from the other domains.
+-- The one table query-engine needs, created by every service that embeds it the first time it starts
+-- (QueryEngineAutoConfiguration runs this file on boot, in the service's own database and default schema,
+-- with the service's own login). Each domain service has its own database, so each has its own copy.
 --
--- Everything lives in the query_engine schema, apart from the domain's projection tables, and runs
--- as the query_engine_owner login (query-engine.store.*). The schema itself is created by the
--- provisioning step (docs/security_protocol.md, ./gradlew provision) so that login needs no right to
--- create schemas. Every name below spells out the schema, so nothing depends on
--- search_path.
+-- A stored query is one row. Its state says where it is in its life (see the PRD, "Query lifecycle"):
+--   drafted    saved, not yet simulated successfully, the definition may carry errors
+--   simulated  the current definition ran successfully against real data, the only state that can be published
+--   published  live: callers with an allowed role can run it through /data-query
+-- The engine's code decides every change of state, the CHECK below only keeps the column to those three values.
 --
--- query-engine keeps no lifecycle state in memory: every draft, published query and list read
--- goes through these tables. All statements are idempotent, so running this on every startup is
--- safe.
+-- This file only creates. It never alters a table that exists, so starting a newer version never changes the
+-- shape of data in place, a change of shape is a deliberate migration. It is safe to run on every start.
 --
--- This file only creates: it never alters a table that exists. A database from before the query_engine
--- schema existed keeps its tables in public (and calls the draft table query_draft, with no fetch_size
--- column): run query-engine/db/migrate_public_to_query_engine.sql as an administrator before starting
--- this version, or those drafts and published queries stay behind.
-
-CREATE TABLE IF NOT EXISTS query_engine.drafted_query (
-    query_name       VARCHAR(255)  NOT NULL PRIMARY KEY,
-    sql_text         TEXT          NOT NULL,
-    params           JSONB         NOT NULL,
-    allowed_roles    JSONB         NOT NULL,
-    validated_query  JSONB,
-    status           VARCHAR(32)   NOT NULL,
-    errors           JSONB         NOT NULL,
-    simulated        BOOLEAN       NOT NULL DEFAULT FALSE,
-    author           VARCHAR(255)  NOT NULL,
+-- Production: a DBA may create this table ahead of time with this exact statement and start the service with
+-- query-engine.schema.initialize=false, so the service login needs no right to create tables in its schema.
+CREATE TABLE IF NOT EXISTS qe_stored_query (
+    query_name       VARCHAR(255)  NOT NULL PRIMARY KEY,            -- {module}.{name}
+    state            VARCHAR(16)   NOT NULL CHECK (state IN ('drafted', 'simulated', 'published')),
+    sql_text         TEXT          NOT NULL,                        -- the SQL template exactly as submitted
+    params           JSONB         NOT NULL,                        -- declared param types as written, e.g. {"status":"String"}
+    fetch_size       INT,                                           -- optional rows per round trip for streaming, null = service default
+    validated_query  JSONB,                                         -- what the executor runs, null while the definition has errors
+    errors           JSONB         NOT NULL,                        -- validation errors, [] when valid
+    allowed_roles    JSONB         NOT NULL,                        -- chosen at publish and kept for the next publish, [] before that
+    author           VARCHAR(255)  NOT NULL,                        -- the holder while drafted / simulated (the lock)
+    revision         BIGINT        NOT NULL,                        -- increases on every write, simulate and publish apply only to the revision they read
     updated_at       TIMESTAMPTZ   NOT NULL,
-    -- Optional rows-per-round-trip for reading the query through a database cursor (null = the service default).
-    fetch_size       INT
+    published_at     TIMESTAMPTZ,                                   -- set when published and never cleared: marks a query that was live
+    published_by     VARCHAR(255)
 );
-
-CREATE TABLE IF NOT EXISTS query_engine.published_query (
-    query_name       VARCHAR(255)  NOT NULL PRIMARY KEY,
-    sql_text         TEXT          NOT NULL,
-    params           JSONB         NOT NULL,
-    allowed_roles    JSONB         NOT NULL,
-    validated_query  JSONB         NOT NULL,
-    published_at     TIMESTAMPTZ   NOT NULL,
-    published_by     VARCHAR(255)  NOT NULL,
-    -- Optional rows-per-round-trip for reading the query through a database cursor (null = the service default).
-    fetch_size       INT
-);
-
--- Identity catalog consulted by the UI when publishing a query (to choose which realm roles and
--- groups may invoke it) and when running a published query (to pick an identity to call as). In a
--- real deployment this mirrors the enterprise identity provider (e.g. Keycloak realm roles and
--- groups), which is shared across domains; here it is a self-contained seeded catalog exposed
--- via GET /query-roles.
-
-CREATE TABLE IF NOT EXISTS query_engine.realm_role (
-    name         VARCHAR(255) NOT NULL PRIMARY KEY,
-    description  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS query_engine.realm_group (
-    name         VARCHAR(255) NOT NULL PRIMARY KEY,
-    path         VARCHAR(255) NOT NULL,
-    description  TEXT
-);
-
-INSERT INTO query_engine.realm_role (name, description) VALUES
-    ('senior_DBA',        'Senior database administrator with broad read access to projections'),
-    ('chief_DBA',         'Lead DBA, may invoke any published query'),
-    ('data_analyst',      'Business/data analyst running reporting queries'),
-    ('branch_manager',    'Branch manager, scoped to their own branch data'),
-    ('warehouse_manager', 'Warehouse manager, scoped to their own warehouse stock'),
-    ('auditor',           'Read-only auditor for compliance reviews'),
-    ('ops_engineer',      'Operations/SRE engineer monitoring live data'),
-    ('read_only',         'Generic least-privilege read-only role')
-ON CONFLICT (name) DO NOTHING;
-
-INSERT INTO query_engine.realm_group (name, path, description) VALUES
-    ('data-platform',   '/data-platform',   'Data platform engineering team'),
-    ('finance',         '/finance',         'Finance department'),
-    ('operations',      '/operations',      'Operations and support'),
-    ('supply-chain',    '/supply-chain',    'Procurement and supply chain planning'),
-    ('audit',           '/audit',           'Internal audit and compliance'),
-    ('branch-managers', '/branch-managers', 'All branch managers'),
-    ('executives',      '/executives',      'Executive leadership')
-ON CONFLICT (name) DO NOTHING;

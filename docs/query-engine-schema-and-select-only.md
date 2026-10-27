@@ -1,5 +1,9 @@
 # Query Engine — Schema Isolation & SELECT-Only Reference
 
+> **Superseded (2026-10-27).** This describes an earlier design with a separate `query_engine` schema, a read-write engine role and a
+> read-only `query_engine_ro` role. The engine now uses one datasource and one table, `qe_stored_query`, and keeps author SQL read-only with
+> `BEGIN READ ONLY` plus the SQL guard. See `docs/security_protocol.md` and the PRD, "Query lifecycle". Kept for reference.
+
 Last updated: 2026-10-25
 
 ## 1. Core Responsibilities of `query-engine`
@@ -21,13 +25,13 @@ To keep complete separation of concerns without maintaining schema-by-schema acc
 - **Projection Schemas:** Projection tables stay in `public` or any other schema defined by a DBA or the host Query Service.
 - **Role & Connection Model:**
   - **Engine Metadata Role (`query_engine`):** Has Read-Write (RW) access **only** to the `query_engine` schema (`AUTHORIZATION query_engine`).
-  - **Projection Execution Role (`query_engine_ro`):** Used on `ProjectionDatabase` to execute user SQL templates. Granted PostgreSQL 14+'s built-in `pg_read_all_data` so it can `SELECT` from any projection schema without specifying schemas one by one, while having **zero write privileges** anywhere.
+  - **Projection Execution Role (`query_engine_ro`):** Used on `ProjectionDatabaseClient` to execute user SQL templates. Granted PostgreSQL 14+'s built-in `pg_read_all_data` so it can `SELECT` from any projection schema without specifying schemas one by one, while having **zero write privileges** anywhere.
 
 ```mermaid
 flowchart LR
     subgraph QE["Query Engine"]
         Meta["Metadata Stores\n(Draft / Publish / List)"]
-        Exec["ProjectionDatabase\n(Simulate / Execute by Name)"]
+        Exec["ProjectionDatabaseClient\n(Simulate / Execute by Name)"]
     end
 
     subgraph DB["PostgreSQL 14+"]
@@ -107,6 +111,6 @@ ALTER TABLE query_engine.realm_group     ENABLE ROW LEVEL SECURITY;
    - Tokenizes the SQL template (skipping comments, string literals, dollar-quoted blocks, quoted identifiers, and `::type` casts).
    - Rejects non-`SELECT` statements, multiple statements (`;`), write/admin keywords (including inside `WITH` CTEs), `SELECT INTO`, locking clauses (`FOR UPDATE` / `FOR SHARE`), references to `query_engine.*` internal tables, and side-effect/session functions (`set_config`, `nextval`, `setval`, `pg_sleep*`, `pg_terminate_backend`, `lo_*`, `dblink*`, `query_to_xml*`, `table_to_xml*`).
 2. **Simulate (Runtime Read-Only Probe):**
-   - Runs the `SELECT` query over `ProjectionDatabase` (`query_engine_ro` + read-only transaction). Any stored function attempting an implicit write fails with `SQLSTATE 25006` / `42501`, preventing `simulated` from becoming `true`.
+   - Runs the `SELECT` query over `ProjectionDatabaseClient` (`query_engine_ro` + read-only transaction). Any stored function attempting an implicit write fails with `SQLSTATE 25006` / `42501`, preventing `simulated` from becoming `true`.
 3. **Publish Pre-Check:**
    - Verifies `simulated = true` and re-validates the draft before writing to `query_engine.published_query`.

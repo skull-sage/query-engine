@@ -1,10 +1,24 @@
 spring:
   application:
     name: order-query
-  # Order domain projection store. query-engine creates its own tables (drafts, published queries,
-  # identity catalog) in this same database, in the query_engine schema, on startup; the projection tables
-  # are seeded by docker/init. Defaults target the dockerized Postgres from docker/docker-compose.yml (host
-  # port 5433), so `./gradlew :order-query:bootRun` works once the database container is up and provisioned.
+  # The service's one datasource. query-engine uses it for everything: it creates its own table (qe_stored_query)
+  # in this database on first start, and runs authors' queries on a second pool of this same datasource, always
+  # inside a read-only transaction (docs/security_protocol.md). The engine has no database settings of its own.
+  #
+  # The defaults below target the dockerized development database (docker/docker-compose.yml, host port 5433).
+  #
+  # PRODUCTION GUIDELINES
+  #  - Secrets: never keep a real password in this file, in the image or in git. Supply R2DBC_URL, DB_USERNAME and
+  #    DB_PASSWORD from the environment or a secret manager and drop the development defaults.
+  #  - Login: use a plain login (NOSUPERUSER, NOCREATEDB, NOCREATEROLE, NOBYPASSRLS) that can read and write this
+  #    service's projection tables, because its event consumers write them, and nothing else. The service refuses to
+  #    start with a superuser or a login that bypasses row-level security (query-engine.security.mode=enforce).
+  #    A write in an author's query cannot succeed whatever this login may do, because author SQL only ever runs in
+  #    BEGIN READ ONLY. Still keep the login as narrow as the service allows.
+  #  - Table: either let this login create qe_stored_query (the engine does it on first start), or have a DBA run
+  #    query-engine's schema.sql, grant this login SELECT, INSERT, UPDATE and DELETE on that table, and set
+  #    query-engine.schema.initialize to false so the login needs no right to create tables.
+  #  - Transport: connect over TLS (for example add ?sslMode=require to the URL) and keep the database off public networks.
   r2dbc:
     url: "${R2DBC_URL:r2dbc:postgresql://localhost:5433/order_query}"
     username: "${DB_USERNAME:order_query}"
@@ -14,35 +28,61 @@ spring:
       initial-size: "${R2DBC_POOL_INITIAL_SIZE:5}"
       max-size: "${R2DBC_POOL_MAX_SIZE:20}"
       max-idle-time: "${R2DBC_POOL_MAX_IDLE_TIME:30m}"
-
 server:
   port: "${SERVER_PORT:8081}"
-
-# query-engine opens two more connection pools of its own, each logging in as a different database user,
-# so no single login can both run authors' queries and change the engine's tables
-# (docs/security_protocol.md). These settings are the only place those logins are defined: `./gradlew
-# provision` reads them, together with spring.r2dbc above and the database name in its url, to create the
-# logins and permissions, and the running service reads them to connect. Without them both pools fall back
-# to spring.r2dbc.*, and the startup check refuses that.
 query-engine:
-  # The engine's own tables in the query_engine schema (drafts, published queries, roles).
-  store:
-    username: "${QE_STORE_USERNAME:query_engine_owner}"
-    password: "${QE_STORE_PASSWORD:qe_owner}"
-  # Authors' queries; this login can read data and nothing else.
-  projection:
-    username: "${QE_PROJECTION_USERNAME:query_engine_ro}"
-    password: "${QE_PROJECTION_PASSWORD:qe_ro}"
-  # Used by `./gradlew provision` only (the administrator login is supplied at that moment, never here).
-  provision:
-    # Schemas that hold this domain's projection tables. The reader finds unqualified table names here and
-    # the service login may write them.
-    projection-schemas: public
-  # Cross-origin (CORS) access for browser pages such as the Query Builder UI (vite dev server, port 5173), which
-  # calls this service directly. `enabled` is the switch; `allowed-origins` (comma separated, exact scheme, host and
-  # port) is who may call. CORS is off when `enabled` is false or the list is empty: the service then sends no CORS
-  # headers and a page on another origin cannot read its responses. Same-origin pages, the UI's proxy mode and
-  # non-browser callers (curl, other services) are never affected. Overrides: QE_CORS_ENABLED, QE_CORS_ALLOWED_ORIGINS.
+  # Create qe_stored_query on start (a single CREATE TABLE IF NOT EXISTS, never an ALTER). Set to false when a DBA
+  # creates the table ahead of time.
+  schema:
+    initialize: "${QE_SCHEMA_INITIALIZE:true}"
+  # What the startup check does about a database login that is a superuser or bypasses row-level security:
+  # enforce (default) refuses to start, warn logs and starts, off skips that check. Use enforce everywhere except a
+  # development machine whose database uses the image's default superuser. Whatever the mode, the service will not
+  # start if a write attempted through the author-SQL path is not refused as read-only.
+  security:
+    mode: "${QE_SECURITY_MODE:enforce}"
+  # Checks run on an author's SQL at draft, simulate, publish and call time: one read-only SELECT, no writes, no
+  # reference to qe_stored_query, no call to a denylisted function. Leave it on. Setting enabled to false only exists
+  # for testing the database protections on their own and must never be done in a shared environment. denied-functions,
+  # if set, REPLACES the built-in list (an entry ending in * matches every name starting with it).
+  #sql-guard:
+  #  enabled: true
+  # The pool that runs author SQL, same datasource as above. Size it for the number of streams you expect to run at
+  # once: each open stream holds one connection until its client has read everything.
+  #projection:
+  #  initial-size: 2
+  #  max-size: 20
+  # Limits on /data-query. fetch-size is the default number of rows read from Postgres per round trip (a query can
+  # set its own). json-max-rows caps a plain application/json answer (bigger results must stream as NDJSON).
+  # stall-timeout ends a stream whose client stops reading, max-duration caps any stream, acquire-timeout is how long
+  # a call waits for a free connection before answering 503. statement-timeout is applied by Postgres to the whole
+  # read of a stream, so keep it above max-duration or it will cut slow readers off first.
+  #stream:
+  #  fetch-size: 50
+  #  max-fetch-size: 10000
+  #  json-max-rows: 1000
+  #  stall-timeout: 30s
+  #  max-duration: 10m
+  #  statement-timeout: 60s
+  #  acquire-timeout: 3s
+  #simulate:
+  #  max-rows: 200
+  # Cross-origin (CORS) access for browser pages such as the Query Builder UI (vite dev server, port 5173), which calls
+  # this service directly. `enabled` is the switch, `allowed-origins` (comma separated, exact scheme, host and port) is
+  # who may call. CORS is off when `enabled` is false or the list is empty: the service then sends no CORS headers and a
+  # page on another origin cannot read its responses. Same-origin pages, the UI's proxy mode and non-browser callers
+  # (curl, other services) are never affected. Overrides: QE_CORS_ENABLED, QE_CORS_ALLOWED_ORIGINS.
+  # PRODUCTION: list only your UI's real https origins, never *. CORS is not authentication: the engine still trusts the
+  # X-Roles and X-Author headers, so put it behind a gateway that authenticates callers and sets them.
   cors:
     enabled: "${QE_CORS_ENABLED:true}"
     allowed-origins: "${QE_CORS_ALLOWED_ORIGINS:http://localhost:5173,http://127.0.0.1:5173}"
+  # The roles and groups the UI offers when choosing who may call a query. Without this the engine's built-in demo
+  # catalog is used. PRODUCTION: list the names that exist in your identity provider (for example Keycloak realm roles
+  # and groups). The catalog only fills the pick-lists, it grants nothing: access is decided by the allowed_roles stored
+  # with each published query, compared with the caller's roles.
+  #roles:
+  #  realm-roles:
+  #    - { name: data_analyst, description: Business analyst running reporting queries }
+  #  groups:
+  #    - { name: finance, path: /finance, description: Finance department }

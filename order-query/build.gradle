@@ -37,23 +37,3 @@ dependencies {
 tasks.named('jar') {
 	enabled = false
 }
-
-// Creates the database logins and permissions query-engine needs, from this service's own
-// application.yml (docs/security_protocol.md): the service login (spring.r2dbc.*), the login that owns
-// the engine's tables (query-engine.store.*) and the read-only login that runs authors' queries
-// (query-engine.projection.*), in the database named in spring.r2dbc.url. Safe to run again, for example
-// after changing a password there.
-//
-//   ./gradlew provision                    # administrator postgres/postgres, the development database
-//   QE_ADMIN_USERNAME=dba QE_ADMIN_PASSWORD=... R2DBC_URL=... ./gradlew provision
-//   ./gradlew provision --args='--query-engine.provision.dry-run=true'    # print the SQL, connect to nothing
-//
-// The administrator login belongs to this run only; the running service never has it.
-tasks.register('provision', JavaExec) {
-group = 'application'
-description = 'Creates the database logins and permissions query-engine needs (docs/security_protocol.md)'
-classpath = sourceSets.main.runtimeClasspath
-mainClass = 'com.brac.query.engine.provision.Provisioner'
-environment 'QUERYENGINE_PROVISION_ADMIN_USERNAME', System.getenv('QE_ADMIN_USERNAME') ?: 'postgres'
-environment 'QUERYENGINE_PROVISION_ADMIN_PASSWORD', System.getenv('QE_ADMIN_PASSWORD') ?: 'postgres'
-}

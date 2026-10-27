@@ -31,9 +31,10 @@ const UNSAVED_MESSAGE = "Your edits to this query haven't been saved as a draft.
  *
  * intent:
  *   { kind: 'new' }
- *   { kind: 'edit', queryName, step: 'draft' | 'simulate' | 'publish', fallbackEntry? }
+ *   { kind: 'edit', queryName, step: 'draft' | 'simulate' | 'publish', fallbackEntry?, unpublish? }
  *     fallbackEntry ({ sql, params }) seeds the editor when the query has no open draft, e.g. to
- *     start a new draft from a published query.
+ *     start a draft from a published query. unpublish is set (after the user confirmed) when that
+ *     published query may be taken offline by the first save.
  *
  * Every request is cancelled when the dialog unmounts. Answers that mean the server's draft has
  * moved on (gone, re-drafted, no longer simulated) send the user to the step that can fix it
@@ -75,7 +76,9 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
           type: 'RESUME_EMPTY',
           yaml: entryToYaml(intent.queryName, fallback || { sql: '', params: {} }),
           notice: fallback
-            ? `${intent.queryName} has no open draft, so this starts a new one from the published version. The published query keeps serving callers until you publish again.`
+            ? intent.unpublish
+              ? `${intent.queryName} is published and in use. Saving your first change takes it offline until you simulate and publish it again. Closing without saving leaves it live.`
+              : `${intent.queryName} has no open draft, so this starts a new one from the published version.`
             : `The draft for ${intent.queryName} no longer exists: it was discarded or published from elsewhere. Write it again and save to start over.`,
         })
       })
@@ -93,7 +96,7 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
       })
       return true
     }
-    if (error.code === 'DRAFT_INVALID' || error.code === 'NOT_SIMULATED') {
+    if (error.code === 'DRAFT_INVALID' || error.code === 'NOT_SIMULATED' || error.code === 'DRAFT_CHANGED') {
       const toDraft = error.code === 'DRAFT_INVALID'
       run((signal) => client.getDrafted(name, { signal }))
         .then((draft) =>
@@ -104,7 +107,9 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
             step: toDraft || draft.status !== 'VALIDATED' ? 'draft' : 'simulate',
             message: toDraft
               ? 'The saved draft has validation errors, so it was reloaded. Fix and save it to continue.'
-              : 'The draft changed since it was simulated (it may have been re-saved elsewhere), so it was reloaded. Run the simulation again before publishing.',
+              : error.code === 'DRAFT_CHANGED'
+                ? 'Someone changed this draft while the request was running, so it was reloaded. Run the simulation again before publishing.'
+                : 'The draft changed since it was simulated (it may have been re-saved elsewhere), so it was reloaded. Run the simulation again before publishing.',
           }),
         )
         .catch((resyncError) => {
@@ -137,7 +142,8 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
     }
     const yaml = state.yamlText
     dispatch({ type: 'DRAFT_START' })
-    run((signal) => client.draft(entry, AUTHOR, { signal }))
+    const body = intent.unpublish ? { ...entry, unpublish: true } : entry
+    run((signal) => client.draft(body, AUTHOR, { signal }))
       .then((draft) => dispatch({ type: 'DRAFT_SUCCESS', draft, yaml }))
       .catch((error) => dispatch({ type: 'DRAFT_FAILURE', error }))
   }
@@ -269,7 +275,9 @@ export default function QueryWizardModal({ intent, knownQueries, onClose, onRun 
           onCancel={() => setConfirm(null)}
           onConfirm={discard}
         >
-          The draft is deleted from {domain.label}. A published version of this query, if there is one, keeps serving callers.
+          {state.draft?.previouslyPublished
+            ? `${state.draft.queryName} was published and is offline while it is being edited. Discarding deletes it completely from ${domain.label}: callers will get "not found". To keep it, publish a corrected version instead.`
+            : `The draft is deleted from ${domain.label}.`}
         </ConfirmDialog>
       )}
     </>
@@ -363,7 +371,8 @@ function existingNameWarning(name, knownQueries) {
   if (!existing) return null
   if (existing.draft) {
     const holder = existing.draft.author !== AUTHOR ? ` held by ${existing.draft.author}` : ''
-    return `${name} already has an open draft${holder}. Saving overwrites it${holder ? ' (or fails if it\u2019s locked)' : ''}. Use its Edit action instead to keep its current content.`
+    const offline = existing.draft.previouslyPublished ? ' (it is a published query that is being edited and is offline)' : ''
+    return `${name} already has an open draft${holder}${offline}. Saving overwrites it${holder ? ' (or fails if it\u2019s locked)' : ''}. Use its Edit action instead to keep its current content.`
   }
-  return `${name} is already published. Saving opens a draft that replaces the published version once you publish it.`
+  return `${name} is already published and in use. Saving is refused unless the query is taken offline: use its Edit action in the list instead.`
 }

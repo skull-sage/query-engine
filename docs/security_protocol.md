@@ -1,267 +1,104 @@
 # Query Engine — Security Protocol
 
-Status: built and checked against the dockerized stack on 2026-10-25 (provisioning moved into a shared template the same day).
-The section "What was checked" lists what was checked and what was not.
+Status: revised 2026-10-27. The engine now uses **one datasource**, the service's own, and **one table**, `qe_stored_query`.
+The earlier design (a separate engine login, a read-only login, a `query_engine` schema and a provisioning step) was removed on
+purpose; the section "What changed from the three-login design" says what that trades away. The section "What was checked"
+lists what was run and what was not.
 
 ## Why
 
-Each domain service (`order-query`, `inventory-query`) embeds query-engine. The engine's own tables used to sit in `public`
-next to the domain's projections (`query_draft`, `published_query`, `realm_role`, `realm_group`), and everything connected
-with one login. In the dev containers that login was a superuser.
-
-A published query is SQL written by an author. Run with that login, it could:
-
-- change the engine's own tables, for example give itself more `allowed_roles`
-- change or drop projection tables
-- write through a stored function, even when the SQL itself looks like a plain `SELECT`
-
-The goal: published SQL can only read projection data, and only the engine's own code can change the engine's tables.
+Each domain service (`order-query`, `inventory-query`) embeds query-engine. A published query is SQL written by an author and
+run by the engine. It must only ever read projection data: it must not write or drop projection tables, change stored queries
+(for example give itself more `allowed_roles`), or write through a stored function that looks like a plain `SELECT`.
 
 ## The four rules
 
-1. **Two separate logins.** `query_engine_owner` owns the `query_engine` schema and is used only by the engine's own
-   code. `query_engine_ro` runs every author query: it may read data and owns nothing. Neither is a superuser, and neither
-   is the service's own login.
-2. **Every author query runs inside `BEGIN READ ONLY`.** Postgres then refuses any write in that transaction, including
-   writes made inside stored functions.
+1. **One datasource.** The engine connects with the service's own `spring.r2dbc.*` login and has no database settings of its
+   own. The login must be a plain one (not a superuser, not `BYPASSRLS`); the service refuses to start otherwise.
+2. **Every author query runs inside `BEGIN READ ONLY`.** On a dedicated pool of the same datasource, used for nothing but
+   author SQL (simulate, `/data-query`, and the `EXPLAIN` check at draft time). Postgres refuses every write in such a
+   transaction, DML and DDL alike, including writes made inside stored functions and `SECURITY DEFINER` functions. The engine's
+   own bookkeeping writes use the service's normal pool and never carry author SQL.
 3. **A SQL lexer checks the query at draft, simulate, publish and call time.** It rejects anything that is not a single
-   `SELECT`. This gives authors clear errors early. It is a guard rail: it can't see inside functions, so rules 1 and 2
-   are what actually protect the data.
-4. **The engine's own SQL always names the schema** (`query_engine.published_query`). It never depends on `search_path`,
-   so a connection pooler such as PgBouncer can't send it to the wrong table.
+   `SELECT`, and any use of `qe_stored_query`. This gives authors clear errors early. It is a guard rail: it cannot see inside
+   functions, so rule 2 is what actually stops writes.
+4. **The backend owns every state change of a stored query.** A query is one row that moves `drafted` -> `simulated` ->
+   `published`. The service checks that a step is allowed (who holds the draft, whether it was simulated, whether the roles are
+   set, whether the SQL still passes the lexer) and applies it as one conditional `UPDATE`, so a step based on a row that
+   changed in the meantime changes nothing. See the PRD, "Query lifecycle".
 
 ## Who can do what
 
-| Login | Owns | Can read | Can write | Used by |
-| --- | --- | --- | --- | --- |
-| Service login (`order_query`, `inventory_query`) | The tables it creates (dev seeds belong to the admin; provisioning grants the service login access) | Projections | Projections | The service's event consumers (`spring.r2dbc.*`) |
-| `query_engine_owner` | `query_engine` schema and its tables | Engine tables | Engine tables | Engine stores and `schema.sql` (`query-engine.store.*`) |
-| `query_engine_ro` | Nothing | Everything, through `pg_read_all_data` | Nothing | Simulate and `/data-query` (`query-engine.projection.*`) |
-| Admin (`postgres`) | The database | Everything | Everything | `./gradlew provision` and, in dev, seeding the projections. Never the running app |
+| Login | Can read | Can write | Used by |
+| --- | --- | --- | --- |
+| The service's own login (`order_query`, `inventory_query`) | its projections and `qe_stored_query` | its projections and `qe_stored_query` | the service's event consumers, the engine's bookkeeping (draft, simulate state, publish, list, lookup), and the author-SQL pool |
+| Admin (`postgres` in development) | everything | everything | creating the login and seeding the projections (`docker/init`). Never the running service |
 
-How the layers stack up for a published query:
+How the layers stack up for an author's SQL:
 
 | Attack | Stopped by |
 | --- | --- |
-| `DELETE`, `UPDATE`, `DROP` in the SQL | Lexer, the read-only transaction, and the login having no write rights |
-| `SELECT my_function()` where the function writes | Read-only transaction (also when the function is `SECURITY DEFINER` owned by a superuser) |
-| `COMMIT; DELETE ...` to break out of the transaction | Lexer (one statement only). The driver also refuses it, see "Checked" below |
-| `UPDATE query_engine.published_query ...` | All three layers. The lexer also blocks reads of `query_engine.*` |
-| `pg_terminate_backend(...)` on the engine's own connections | Separate logins (a login can only kill its own sessions), plus the lexer's function denylist |
-| `set_config(...)` that leaks to the next caller | Lexer function denylist. Without it the call works and stays on the pooled connection, see "Checked" below |
+| `DELETE`, `UPDATE`, `DROP`, `TRUNCATE`, DDL in the SQL | Lexer, and the read-only transaction (`SQLSTATE 25006`) |
+| `UPDATE qe_stored_query ...` (widen `allowed_roles`, publish something unsimulated) | Lexer, and the read-only transaction |
+| Reading other queries' SQL or roles from `qe_stored_query` | Lexer only (the login may read its own table) |
+| `SELECT my_function()` where the function writes, even `SECURITY DEFINER` owned by a superuser | The read-only transaction |
+| `COMMIT; DELETE ...` to break out of the transaction | Lexer (one statement only). The driver also refuses several commands in one prepared statement |
+| `set_config(...)` that leaks to the next caller on a pooled connection | Lexer function denylist. Without it the call works, but the explicit `BEGIN READ ONLY` still holds |
+| `pg_terminate_backend(...)` on the service's own sessions | Lexer function denylist only; everything shares one login now |
+| A stored query that was published before a rule was added | Checked again at call time (`SQL_REJECTED`) and logged at startup |
 
-### Known trade-off: `pg_read_all_data`
+## What changed from the three-login design
 
-`pg_read_all_data` lets `query_engine_ro` read every table in every schema, including `query_engine`, and it can't be
-narrowed to exclude one schema. It also covers every other database on the same server that this login may connect to.
-That is the price of "we don't need to track which schemas exist". Two things limit it:
+The earlier design used `query_engine_owner` (owns the engine's tables) and `query_engine_ro` (author SQL, reads only), kept apart
+by a provisioning step and a startup check. This design drops them. What that gives up:
 
-- The lexer rejects any reference to `query_engine.` in author SQL. (With the lexer switched off, a query can read the
-  engine's tables. This was confirmed; writing them fails.)
-- Provisioning revokes `CONNECT` on the domain database from `PUBLIC`, then grants it to the three logins.
-
-If drafts and role mappings must be strictly hidden, replace `pg_read_all_data` with explicit `GRANT SELECT` per
-projection schema. The section "Alternative: explicit grants" below shows the DDL.
-
-## DDL changes
-
-### 1. Provisioning: one shared template, filled in from `application.yml`
-
-The statements that create the logins and set the permissions live once, in the library:
-`query-engine/src/main/resources/query-engine/provision.sql`. They need administrator rights, so the running service never
-runs them. A small program in the library, `com.brac.query.engine.provision.Provisioner`, loads the service's own
-`application.yml` the way the service does (profiles, environment variables, command line), fills in the template and runs it
-as an administrator, in one transaction. Each service has a Gradle task for it:
-
-```bash
-./gradlew provision                                              # the dev database, administrator postgres/postgres
-QE_ADMIN_USERNAME=dba QE_ADMIN_PASSWORD=... R2DBC_URL=... ./gradlew provision      # any other database
-./gradlew provision --args='--query-engine.provision.dry-run=true'                 # print the SQL (passwords hidden), connect to nothing
-```
-
-Nothing is written twice. Every value comes from a setting the service already has:
-
-| Value | Setting in `application.yml` |
+| Gone | Effect |
 | --- | --- |
-| database name | the database in `spring.r2dbc.url` (or `query-engine.provision.database`) |
-| service login and its password | `spring.r2dbc.username`, `spring.r2dbc.password` |
-| engine login (`query_engine_owner`) and its password | `query-engine.store.username`, `query-engine.store.password` |
-| reader login (`query_engine_ro`) and its password | `query-engine.projection.username`, `query-engine.projection.password` |
-| schemas that hold projection tables | `query-engine.provision.projection-schemas` (default `public`) |
+| A login that could not write anything | If author SQL ever ran outside the read-only wrapper, the login would no longer stop a write. Mitigated by making the wrapper the only way to reach that pool (`ProjectionDatabaseClient.client()` is package-private) and by a startup self-test that sends a write through it and requires Postgres to refuse it |
+| `pg_read_all_data` and the engine's tables closed to author SQL | The login can read `qe_stored_query`. Only the lexer keeps author SQL away from it |
+| Separate logins in the database log | `pg_stat_activity` shows one login; the pools differ by `application_name` (`query-engine-projection` for author SQL) |
+| A login that could not kill the engine's sessions | Only the lexer's function denylist stops `pg_terminate_backend` |
 
-The administrator login is the one thing that is not in the yml, on purpose: the running service must never have it. The task
-passes it as the environment variables `QUERYENGINE_PROVISION_ADMIN_USERNAME` and `..._PASSWORD`, taken from
-`QE_ADMIN_USERNAME` and `QE_ADMIN_PASSWORD` (default `postgres` / `postgres`, the dev database). The run stops with a message
-naming the setting when one is missing, and when the three logins are not three different users.
+What it keeps: Postgres itself refuses every write from author SQL (rule 2), and that held in every test, including with the
+lexer switched off. The lexer is the only thing standing between author SQL and reading the stored queries.
 
-The template is plain SQL with `kind:name` placeholders in double braces (`ident`, `literal`, `idents`, `literals`). The
-program quotes every value, so a name or password cannot break out of its quotes (`ProvisionSql`, unit tested). It runs 13
-statements and is safe to run again, which is also how you change a password: edit it in the yml, run `provision`.
+## Startup checks (`SecurityStartupCheck`)
 
-| Step | What it does |
-| --- | --- |
-| Logins | Creates the service login only if it is missing (its password and attributes belong to whoever manages it). Creates the engine and reader logins if missing and always sets their password to the configured one, `NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS` |
-| Engine schema | `CREATE SCHEMA IF NOT EXISTS query_engine AUTHORIZATION <engine login>`, makes that login its owner and the owner of any table already in it, `REVOKE ALL ... FROM PUBLIC` |
-| Reader | `GRANT pg_read_all_data` (Postgres 14+); role settings `default_transaction_read_only = on` (a safety net under rule 2) and `search_path` = the projection schemas |
-| Service login | `USAGE, CREATE` on each projection schema, read/write on its existing tables and sequences, and default privileges for ones the administrator creates later. Tables the service creates itself it owns |
-| Defaults | `REVOKE CREATE ON SCHEMA public FROM PUBLIC`; `REVOKE TEMPORARY` and `REVOKE CONNECT ON DATABASE` from `PUBLIC`; `GRANT CONNECT` to the three logins |
+1. **Read-only self-test, always.** Through the very path author SQL takes, the engine requires `transaction_read_only = on` and
+   sends a harmless write (`CREATE TEMPORARY TABLE`) that must be refused with `SQLSTATE 25006`. If not, the service does not
+   start, in every mode.
+2. **The login.** In `query-engine.security.mode=enforce` (the default) the service refuses to start if the login is a superuser
+   or bypasses row-level security. `warn` logs and starts, for a development machine whose database uses the image's default
+   superuser. `off` skips this check.
+3. **Stored queries.** Every published query is run through the lexer; failures are logged and are refused when called.
 
-Notes:
+## The table
 
-- Role names are server-wide. The dev setup has one Postgres per domain, so the plain names are fine. If several domain
-  databases share one Postgres server, give each domain its own pair in the yml (`order_engine_owner`, `order_engine_ro`) so
-  one domain's reader can't connect to another domain's database.
-- Revoking `CONNECT` from `PUBLIC` means any other login that uses this database needs its own `CONNECT` grant. Superusers are
-  not affected.
-- A domain that keeps projections outside `public` lists its schemas in `query-engine.provision.projection-schemas`.
+`query-engine/src/main/resources/query-engine/schema.sql` is a single `CREATE TABLE IF NOT EXISTS qe_stored_query`. It runs on
+boot with the service's login, in the service's default schema. No SQL file in the repository contains an `ALTER`: a file that
+changes tables in place makes a startup do things nobody planned. A change to the table's shape is a deliberate migration (a new
+table name, or a script a person runs), not a side effect of starting a newer version. Columns and meaning: PRD, "Query
+lifecycle".
 
-### 2. Configuration (`application.yml`) and Docker
+For production the table can be created ahead of time by a DBA with that same statement (the service login then needs `SELECT`,
+`INSERT`, `UPDATE` and `DELETE` on it and no right to create tables), with `query-engine.schema.initialize=false`.
 
-Both services now use `application.yml` (the `.properties` files are gone). The part that matters here, from
-`order-query`; every value can be overridden by the environment variable shown:
+## Production guidance
 
-```yaml
-spring:
-  r2dbc:
-    url: "${R2DBC_URL:r2dbc:postgresql://localhost:5433/order_query}"   # the database name lives here
-    username: "${DB_USERNAME:order_query}"                              # the service login
-    password: "${DB_PASSWORD:order_query}"
-query-engine:
-  store:                                                                # the engine's tables
-    username: "${QE_STORE_USERNAME:query_engine_owner}"
-    password: "${QE_STORE_PASSWORD:qe_owner}"
-  projection:                                                           # authors' queries
-    username: "${QE_PROJECTION_USERNAME:query_engine_ro}"
-    password: "${QE_PROJECTION_PASSWORD:qe_ro}"
-  provision:
-    projection-schemas: public
-```
+The same points are written as comments in each service's `application.yml`.
 
-In `docker-compose.yml`, `POSTGRES_USER` is a separate admin (`postgres`). It seeds the projection tables from `docker/init`
-(before any login exists, so those tables belong to the admin and provisioning grants the service login access to them) and
-is what `./gradlew provision` connects as. The init folder no longer creates logins. The service container gets the same
-`DB_*` and `QE_*` variables as before. Order of events, which `./dry-run.sh` follows (also with `--db-only`):
-database up, `./gradlew provision`, service up. A service started before provisioning stops at startup, naming the problem.
-
-### 3. `schema.sql` (changed)
-
-The engine runs this as `query_engine_owner`, so that login owns the tables. Every name is qualified, and it only creates:
-no `ALTER` is left. `fetch_size` (rows per round trip for a query read through a cursor) is a column of the two query tables
-from the start.
-
-```sql
-CREATE TABLE IF NOT EXISTS query_engine.drafted_query (
-    query_name VARCHAR(255) NOT NULL PRIMARY KEY, sql_text TEXT NOT NULL, ... updated_at TIMESTAMPTZ NOT NULL,
-    fetch_size INT );
-CREATE TABLE IF NOT EXISTS query_engine.published_query ( ... published_by VARCHAR(255) NOT NULL, fetch_size INT );
-CREATE TABLE IF NOT EXISTS query_engine.realm_role  ( ... );
-CREATE TABLE IF NOT EXISTS query_engine.realm_group ( ... );
-INSERT INTO query_engine.realm_role  (name, description)       VALUES ... ON CONFLICT (name) DO NOTHING;
-INSERT INTO query_engine.realm_group (name, path, description) VALUES ... ON CONFLICT (name) DO NOTHING;
-```
-
-`query_draft` is renamed `drafted_query`, to match `published_query`. The `DROP COLUMN expires_at` and the `fetch_size`
-column for older tables moved to the migration script below. `schema.sql` does not create the schema: provisioning does, so
-the engine login needs no right to create schemas. For a development database that was never provisioned, the engine creates
-`query_engine` itself when it is missing, which only works for a login that may create schemas; otherwise startup stops with
-a message pointing at `./gradlew provision`.
-
-### 4. Moving an existing database (one-off, runs as admin)
-
-Built as `query-engine/db/migrate_public_to_query_engine.sql`. For a database that already has the engine tables in
-`public`. It keeps every draft and published query, only moves tables that aren't already in `query_engine`, renames
-`query_draft` to `drafted_query` (and its primary-key index), makes `query_engine_owner` the owner, drops the old
-`expires_at` column and adds the `fetch_size` column to tables from before it existed. Safe to run more than once.
-
-Run `./gradlew provision` first (it creates the schema and logins), then this, and only then start the new engine version.
-Otherwise `schema.sql` creates an empty `drafted_query` and the old drafts stay behind in `query_engine.query_draft`. At
-startup the engine logs a warning when it finds `query_draft` or `published_query` still in `public`.
-
-```sql
-DO $$
-DECLARE t text;
-BEGIN
-  FOREACH t IN ARRAY ARRAY['query_draft', 'published_query', 'realm_role', 'realm_group'] LOOP
-    IF to_regclass('public.' || t) IS NOT NULL AND to_regclass('query_engine.' || t) IS NULL THEN
-      EXECUTE format('ALTER TABLE public.%I SET SCHEMA query_engine', t);
-    END IF;
-  END LOOP;
-
-  IF to_regclass('query_engine.query_draft') IS NOT NULL AND to_regclass('query_engine.drafted_query') IS NULL THEN
-    ALTER TABLE query_engine.query_draft RENAME TO drafted_query;
-    ALTER INDEX IF EXISTS query_engine.query_draft_pkey RENAME TO drafted_query_pkey;
-  END IF;
-
-  FOREACH t IN ARRAY ARRAY['drafted_query', 'published_query', 'realm_role', 'realm_group'] LOOP
-    IF to_regclass('query_engine.' || t) IS NOT NULL THEN
-      EXECUTE format('ALTER TABLE query_engine.%I OWNER TO query_engine_owner', t);
-    END IF;
-  END LOOP;
-END $$;
-ALTER TABLE IF EXISTS query_engine.drafted_query DROP COLUMN IF EXISTS expires_at;
-ALTER TABLE IF EXISTS query_engine.drafted_query   ADD COLUMN IF NOT EXISTS fetch_size INT;
-ALTER TABLE IF EXISTS query_engine.published_query ADD COLUMN IF NOT EXISTS fetch_size INT;
-```
-
-### Alternative: explicit grants instead of `pg_read_all_data`
-
-Use this when `query_engine_ro` must not see `query_engine` at all. Repeat it for each projection schema. Not built; the
-startup check works the same way with it.
-
-```sql
-GRANT USAGE  ON SCHEMA public TO query_engine_ro;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO query_engine_ro;
-ALTER DEFAULT PRIVILEGES FOR ROLE order_query IN SCHEMA public GRANT SELECT ON TABLES TO query_engine_ro;
-```
-
-## Code changes (query-engine library)
-
-### Engine connection
-
-- `store.EngineDatabase`, built like `ProjectionDatabase`: its own small pool (default max 5) and its own
-  `DatabaseClient`, logging in with `query-engine.store.*`. Those settings fall back to `spring.r2dbc.*`, so a service
-  still starts without them, but then the startup check (below) refuses it unless it is in `warn` mode.
-- `DraftStore`, `PublishedQueryRepository` and `QueryRolesRepository` use it, and every statement names `query_engine.`.
-- `schema.sql` runs on that pool, not on the service's. It only creates; see "3. schema.sql" above.
-- Publish saves the published query and deletes the draft in one transaction: `EngineDatabase.inTransaction(...)`, a
-  `TransactionalOperator` over the same pool. It is not exposed as a transaction-manager bean, because Spring Boot and the
-  consuming service expect exactly one, on the service's own pool. The old `@Transactional` on `publish` is gone.
-- `config.ConnectionSettings` resolves url, user and password for both pools (own setting, else `spring.r2dbc.*`).
-
-### Provisioning
-
-- `provision.ProvisionSql` fills in the template's placeholders with quoted values and splits the result into statements (using
-  `SqlLexer`, so a `;` inside a `DO` body does not split it). Pure text work, unit tested.
-- `provision.Provisioner` is the entry point (`main`): it starts a Spring context that only loads the configuration, collects the
-  values from `spring.r2dbc.*`, `query-engine.store.*` and `query-engine.projection.*`, connects as the administrator and runs the
-  statements in one transaction. `provision.ProvisionProperties` binds `query-engine.provision.*` (admin login, database,
-  projection schemas, dry run).
-- Each service's `build.gradle` has a `provision` task (a `JavaExec` on the service's runtime classpath) that sets the
-  administrator from `QE_ADMIN_USERNAME` / `QE_ADMIN_PASSWORD`.
-
-### Projection connection
-
-- `query-engine.projection.username` and `password` point at `query_engine_ro`.
-- The connection options now also carry `default_transaction_read_only=on` and `standard_conforming_strings=on` (the lexer
-  assumes backslashes are plain inside `'strings'`), next to the existing `statement_timeout`.
-- `ProjectionStoreExecutor.stream` runs each query inside its own read-only transaction:
-  `ProjectionDatabase.inReadOnlyTransaction`, a `TransactionalOperator` with a read-only definition (and
-  `enforceReadOnly`, which also sends `SET TRANSACTION READ ONLY`). It opens when the stream starts and ends on finish,
-  error or client disconnect; the cursor already held the connection for that long.
-
-### Startup check
-
-`security.SecurityStartupCheck` runs after the tables exist. It reads what the database says about both logins and, in
-`enforce` mode (the default), refuses to start if any of these is true:
-
-- the engine login and the projection login are the same user
-- either login is a superuser, or the projection login has `BYPASSRLS`
-- the projection login owns the `query_engine` schema
-- the projection login can `INSERT`, `UPDATE`, `DELETE` or `TRUNCATE` on any table (the engine's or the domain's)
-
-`query-engine.security.mode=warn` logs the same findings and starts anyway, for a dev machine that is not provisioned yet;
-`off` skips the login checks. It then runs the lexer over every stored published query and logs a warning for each one
-that fails; those are also refused when called. Finally it warns about engine tables still left in `public`.
+- **Secrets.** No real password in `application.yml`, the image or git. Supply `R2DBC_URL`, `DB_USERNAME` and `DB_PASSWORD` from the
+  environment or a secret manager.
+- **Login.** A plain login (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS`) that can read and write this service's projection
+  tables and nothing else. Keep it as narrow as the service allows, even though author SQL cannot write.
+- **Transport.** TLS to the database (for example `?sslMode=require`), and the database off public networks.
+- **Identity.** The engine trusts the `X-Roles` and `X-Author` headers; there is no authentication yet. Put it behind a gateway
+  that authenticates callers and sets them, and never expose a service port directly. CORS is not authentication.
+- **CORS.** Only your UI's real `https` origins in `query-engine.cors.allowed-origins`, never `*`.
+- **SQL guard.** Leave `query-engine.sql-guard.enabled` on. Turning it off exists only to test the database protection by itself.
+- **Roles catalog.** `query-engine.roles` should list the names that exist in your identity provider. It only fills pick-lists.
+- **Limits.** `query-engine.stream.*` bounds streams (`max-duration`, `stall-timeout`, pool `acquire-timeout`). Keep
+  `statement-timeout` above `max-duration`, because Postgres applies it to the whole read of a stream.
 
 ## SQL lexer validation
 
@@ -294,7 +131,7 @@ Errors use the same `{ code, param, message }` shape as the param checks. Messag
 | `SQL_DATA_MODIFYING` | No `INSERT`, `UPDATE`, `DELETE` or `MERGE` word anywhere, which also covers a DML main statement after `WITH`. Not after a `.` (`t.update`) and not inside quotes | `WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x` |
 | `SQL_SELECT_INTO` | No `INTO` (it creates a table) | `SELECT * INTO copy FROM t` |
 | `SQL_LOCKING_CLAUSE` | No `FOR UPDATE`, `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR KEY SHARE` | `SELECT * FROM t FOR UPDATE` |
-| `SQL_FORBIDDEN_SCHEMA` | No reference to `query_engine.` | `SELECT * FROM query_engine.published_query` |
+| `SQL_FORBIDDEN_TABLE` | No use of the engine's own table, `qe_stored_query`, under any schema prefix, quoting or case | `SELECT sql_text FROM qe_stored_query` |
 | `SQL_FORBIDDEN_FUNCTION` | No call to a denylisted function | `SELECT pg_sleep(600)` |
 | `SQL_UNSUPPORTED_SYNTAX` | No `U&"..."` names, whose escapes would hide the real name | `SELECT * FROM U&"pg_sl\0065ep"(1)` |
 
@@ -308,7 +145,7 @@ every name starting with it). A name matches when it is followed by `(`, with or
 - server files: `pg_read_file`, `pg_read_binary_file`, `pg_ls_dir`, `pg_stat_file`
 - run other SQL text, or read a table named by a string: `query_to_xml*`, `cursor_to_xml*`, `table_to_xml*`,
   `schema_to_xml*`, `database_to_xml*` (each also with `_and_xmlschema` and `xmlschema` variants). The `table_to_xml`
-  family is there because it would read `'query_engine.published_query'` without the name ever appearing as an identifier.
+  family is there because it would read `'qe_stored_query'` without the name ever appearing as an identifier.
 
 Rules are deliberately targeted rather than a blanket keyword ban. A column called `status`, `comment` or `end` keeps
 working, `CASE ... END` is fine, and so is `updated_at`: words are compared whole. A column literally called `update`,
@@ -362,89 +199,60 @@ stays the authority: the UI never blocks a save on its own checks.
 - `SQL_REJECTED` (simulate, publish or run) shows under the plain title "Not a read-only SELECT" with the server's message.
 - The denylist is a copy in the UI. If a deployment changes it, the server's answer wins.
 - The Downstream demo's printed `psql` hint now connects as `postgres`, since the stream's sessions belong to
-  `query_engine_ro` and other logins can't see their queries in `pg_stat_activity`.
+  the service login, and a plain login cannot see another login's queries in `pg_stat_activity`.
 
 Tests: `vitest` 5.0.5 (pinned dev dependency, `npm test`). `src/sql/sqlGuard.test.js` runs the same case file as the
 backend, read by relative path, so the two lexers can't quietly drift apart. `checkDefinition.test.js` covers each definition
 problem and checks that the sample drafts and the demo query the UI ships pass.
-## What was checked (2026-10-25)
 
-Against the dockerized stack (Postgres 14, both domains), from a fresh volume, unless noted. The work was done in two rounds:
-first with the logins created by SQL scripts in each service's `docker/init`, then again after provisioning moved into the
-shared template described above. The grants are the same in both.
+## What was checked (2026-10-27)
 
-**Passed after the move to the shared template (re-run)**
+Against the dockerized stack (Postgres 14, both domains), from a fresh volume, after the move to one datasource.
 
-- Provisioning from a fresh database in both domains: 13 statements applied. Roles: the service login, `query_engine_owner`
-  and `query_engine_ro` are not superusers and cannot create databases or roles; `query_engine_ro` is a member of
-  `pg_read_all_data` with `default_transaction_read_only=on` and `search_path=public`; `query_engine` is owned by
-  `query_engine_owner` and closed to `PUBLIC`; the database grants `CONNECT` to the three logins only.
-- Layout: the four engine tables exist only in `query_engine`, owned by `query_engine_owner`, and `fetch_size` is a column of
-  both query tables although `schema.sql` has no `ALTER`. The service login can insert into a projection table, the reader
-  cannot but can select. The engine pool connects as `query_engine_owner` and the projection pool as `query_engine_ro`.
-- Running it again changes nothing and succeeds. Changing `query-engine.store.password` through the environment and running it
-  again made the old password stop working and the new one work; running it with the default restored the original.
-  `--query-engine.provision.dry-run=true` printed the SQL with every password shown as `'********'` and connected to nothing.
-- Failures are one line and exit 1: a wrong administrator password (`password authentication failed for user "postgres"`),
-  the service login set to the same user as the reader (`must be three different users`), and a blank
-  `query-engine.store.password` (names the setting).
-- `./dry-run.sh --db-only` publishes the library and provisions both databases, so `bootRun` works against just the database
-  containers; the full run provisions between building a service and starting its container.
-- The existing flows in both domains, with a `fetchSize` of 25 stored on the published query: draft, simulate, publish,
-  invoke as JSON and NDJSON, a `403` for another role, and the role catalog. Drafts that are not a read-only SELECT are
-  rejected with `SQL_NOT_SELECT`, `SQL_MULTIPLE_STATEMENTS`, `SQL_FORBIDDEN_SCHEMA` and `SQL_FORBIDDEN_FUNCTION`.
-- The service starts from `application.yml` alone and its startup check passes.
-- The invalid-definition notifications, in real headless Chrome against the running UI and service (20 checks): a valid sample shows no
-  alert; typing `DELETE FROM ...` shows the red panel, the red outline, the header badge and the footer note without saving; saving it
-  shows the server's list once (not twice), keeps the outline, and offers no `Continue to simulate`; fixing it clears everything and
-  saving validates; undeclared, unused and unknown-type params, and broken YAML, are each flagged.
-- Migration: a database in the old layout (tables in `public`, one draft and one published query, and no `fetch_size`
-  column at all) was moved, renamed, re-owned and given the column with the data intact; a second run changed nothing; the
-  new `schema.sql` then ran cleanly as `query_engine_owner`.
-- Tests: `gradlew test` in `query-engine` (123 tests: 108 for the SQL guard, 12 for the provisioning text, 3 for stream limits)
-  and `npm test` in `query-builder-ui` (110 tests); the UI builds.
+**Passed**
 
-**Passed earlier, on the same grants (not repeated after the move)**
-
-- 50,000 rows streamed as NDJSON in about 2.5 s inside the read-only transaction (`outcome=completed rows=50000`). Ten
-  clients cut off mid-stream were all logged as cancelled and left every connection `idle`, none `idle in transaction`.
-- Rejected at draft time, with the right code: a data-modifying CTE, `SELECT INTO`, `FOR UPDATE`, an unterminated string.
-  Simulate on such a draft is `422 DRAFT_INVALID`. `x::text` is no longer a false `UNDECLARED_PARAM`.
-- A stored query that breaks the rules is `422 SQL_REJECTED` when called, and the startup audit counts it.
-- With the lexer switched off (the dev switch), so the database layers stand alone:
-  - `UPDATE` on a projection, `CREATE TABLE AS`, `UPDATE query_engine.published_query` and a data-modifying CTE all fail
-    with SQLSTATE `25006` (read-only transaction)
-  - a `SECURITY DEFINER` function owned by a superuser that updates a table fails the same way
-  - after `set_config('default_transaction_read_only', 'off', false)` leaked onto pooled connections (a probe saw
-    `default_transaction_read_only = off`), `transaction_read_only` was still `on`, and ten `UPDATE`s on a table the reader
-    had full rights to all failed. So the explicit `BEGIN READ ONLY` is what holds, not the session default
-- Several statements in one call (`SELECT 1; COMMIT; UPDATE ...`, with and without a `fetchSize`) are refused by Postgres:
-  "cannot insert multiple commands into a prepared statement". The driver uses the extended protocol because the service
-  always sets a `fetchSize` above 0. The lexer is still the rule that guarantees it, since this depends on the driver.
-- Publish is all-or-nothing: with a trigger that made the draft delete fail, the publish returned `500` and left no
-  published row and the draft in place; after removing the trigger it published and removed the draft.
-- Startup check: it refuses to start (exit 1, with the reasons) when the projection login is the engine login, a superuser,
-  or the service login (which can write the projections); with `mode=warn` it logs the same and starts. It warns when
-  `public.query_draft` is found.
+- Fresh `./dry-run.sh` for both domains: no provisioning step. The init script creates the service login as a plain login; the
+  service starts, creates `qe_stored_query` (owned by that login), and the startup log shows "Security check passed: author SQL runs
+  read-only as login 'order_query'" (and `'inventory_query'`).
+- The lifecycle, in 38 live checks on `order-query`: draft; another author locked out; publish refused before simulate; simulate;
+  an edit clears "simulated"; publish needs roles; publish; `/data-query` as an allowed role, a refused role and a bare name; draft
+  over a published query refused without `unpublish`; simulate and discard of a published query refused; unpublish by another author
+  keeps the previous roles; `/data-query` while being edited answers `409 QUERY_NOT_PUBLISHED`; republish with new roles takes effect
+  (old role refused); discard of an offline query deletes it (`404` afterwards); invalid SQL stays a draft with `SQL_INVALID`; reading
+  `qe_stored_query` is rejected; and a re-draft that overlaps a running simulate makes the simulate answer `409 DRAFT_CHANGED` and
+  leaves the new draft un-simulated.
+- With the SQL guard switched off (`QUERYENGINE_SQLGUARD_ENABLED=false`), so only the database protection is left, every one of these
+  failed with `SQLSTATE 25006` and changed nothing (24 projection rows intact, none `HACKED`, no new tables, no stored queries
+  touched): `UPDATE` and `DELETE` on a projection, `CREATE TABLE AS`, `SELECT INTO`, `UPDATE qe_stored_query`, a data-modifying CTE,
+  and a `SECURITY DEFINER` function owned by the superuser that updates a table. After `set_config('default_transaction_read_only',
+  'off', false)` was run six times to leak onto pooled connections, four further `UPDATE`s and the definer function still failed.
+  `DROP TABLE`, `TRUNCATE` and `COMMIT; UPDATE ...` were refused at draft time as invalid SQL; a two-statement query was refused by
+  the driver. Reading `qe_stored_query` worked with the guard off, as the trade-off above says.
+- A superuser login: refused at startup in `enforce` mode with the reason and the way out; with `QE_SECURITY_MODE=warn` it starts and
+  logs the same text.
+- UI, in real headless Chrome: draft, simulate and publish through the wizard; Edit on a published query shows the "take it offline"
+  confirmation and sends no `unpublish` until the first save; the list shows "Offline · being edited" with no Run button; the discard
+  confirmation says it deletes the query completely; republishing starts with the previous roles ticked.
+- Tests: 140 backend (including 14 for the lifecycle rules and 113 SQL guard cases) and 133 UI.
 
 **Not checked**
 
-- Postgres versions other than 14, a real PgBouncer, and a production provisioning run with real secrets and a DBA-owned
-  administrator login (only the dev `postgres` login was used).
-- Provisioning a database whose service login already exists with its own password or tables (the template leaves an existing
-  service login alone, but this path was not run), and a projection schema other than `public`.
-- The 100K-row, 6-concurrent-pull memory and saturation baseline from `reactive_R2DBC_Cursor-impl.md`. The 50K pull above
-  matched earlier timings, but this is not a like-for-like comparison.
-- The explicit-grants alternative.
+- Postgres versions other than 14, PgBouncer, a production setup with a DBA-created login and table
+  (`query-engine.schema.initialize=false`), and a login without the right to create tables.
+- A database that still holds the previous design's schema and tables: they are not migrated or read (there is deliberately no
+  migration script). A development volume is reset by `./stop.sh`.
+- The 100K-row, 6-concurrent-pull memory baseline from `reactive_R2DBC_Cursor-impl.md`.
+- Several instances of one service running against one database at the same time (the conditional writes are designed for it but it
+  was not run).
+
 ## Open points
 
-- PgBouncer: not used today. Rule 4 covers the engine's own SQL. Author queries rely on the reader login's
-  `search_path`, which is set on the role and so works behind a pooler. PgBouncer older than 1.21 doesn't support the
-  prepared statements the driver uses in transaction mode. Check the version if one is added.
-- Session settings: with `set_config` denylisted, author SQL can't change session settings. If a gap turns up, add a
-  connection reset when a connection returns to the projection pool.
-- A write attempt that reaches the database (only possible with the lexer off) comes back as `500 QUERY_EXECUTION_FAILED`
-  with SQLSTATE `25006` rather than a dedicated code.
-- `docs/reactive_R2DBC_Cursor-impl.md` section 12 is an earlier plan for the same problem; this document replaces it.
-- The 77.8% stream halt (`statement_timeout` across a whole cursor read) is unchanged by this work and stays on the
-  pending list.
+- The login can read `qe_stored_query` (SQL text and allowed roles of every query). Only the lexer keeps author SQL from it. If that
+  is not acceptable, the table would have to move to a schema or login the author-SQL pool cannot read, which is the design this one
+  replaced.
+- A write attempt that reaches the database (only possible with the lexer off) comes back as `500 QUERY_EXECUTION_FAILED` with
+  `SQLSTATE 25006` rather than a dedicated code.
+- Session settings: with `set_config` denylisted, author SQL cannot change session settings. If a gap turns up, add a connection
+  reset when a connection returns to the projection pool.
+- The 77.8% stream halt (`statement_timeout` across a whole cursor read) is unchanged by this work and stays on the pending list
+  (`docs/PROGRESS.md`).

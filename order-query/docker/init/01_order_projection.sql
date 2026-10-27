@@ -13,8 +13,8 @@
 -- Column names are intentionally unquoted so Postgres folds them to lowercase (orderid,
 -- branchid, ...), matching how it folds the unquoted identifiers in a query template.
 
--- Seeded as the administrator (docker-entrypoint-initdb.d), before the database logins exist; `./gradlew provision`
--- then lets the service login use and write these tables.
+-- Seeded as the administrator (docker-entrypoint-initdb.d), after 00_service_login.sql, and then granted to the
+-- service login at the end of this file: the service's event consumers write these tables.
 
 CREATE TABLE IF NOT EXISTS order_projection (
     orderId      VARCHAR(32)    NOT NULL PRIMARY KEY,
@@ -52,3 +52,6 @@ INSERT INTO order_projection (orderId, status, total, branchId, channel, custome
     ('O-1023', 'PROCESSING',   67.35, 12, 'CALL_CENTER', 'SILVER', '2026-10-10'),
     ('O-1024', 'SHIPPED',     158.80,  9, 'MOBILE',      'GOLD',   '2026-10-01')
 ON CONFLICT (orderId) DO NOTHING;
+
+-- The service's login reads and writes this table (its event consumers maintain it).
+GRANT SELECT, INSERT, UPDATE, DELETE ON order_projection TO order_query;

@@ -1,31 +1,27 @@
 name: order-query
-
 # OrderQuery stack: the Order domain's own Postgres projection store plus the OrderQuery service.
-# Fully independent from inventory-query: separate database, network, ports and lifecycle.
+# Fully independent from the other domain: separate database, network, ports and lifecycle.
 services:
   postgres:
     image: postgres:14-alpine
     container_name: order-query-postgres
     environment:
       POSTGRES_DB: order_query
-      # Administrator login: seeds the projection tables below and is what `./gradlew provision` connects as
-      # (from the host, on the port published below). The service never uses it: it connects as the logins
-      # `./gradlew provision` creates from application.yml (order_query, query_engine_owner, query_engine_ro).
+      # Administrator login (development only): runs the scripts in ./init, which create the service's login
+      # and the projection tables. The service never connects as it.
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports:
       - "5433:5432"
     volumes:
-      # Projection tables only. The logins and permissions come from `./gradlew provision` (run it after
-      # this database is up and before the service starts; ./dry-run.sh does), and query-engine creates its
-      # own tables (in the query_engine schema) when the service starts.
+      # ./init runs once, when the database is first created: the service's login, then the projection tables.
+      # query-engine creates its own table (qe_stored_query) when the service starts.
       - ./init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d order_query"]
       interval: 2s
       timeout: 3s
       retries: 30
-
   # Stopping/starting this container (`docker compose stop|start order-query`) while Postgres keeps
   # running is the manual check that the service holds no in-memory state.
   order-query:
@@ -36,13 +32,10 @@ services:
     environment:
       SERVER_PORT: "8081"
       R2DBC_URL: r2dbc:postgresql://postgres:5432/order_query
-      # Three logins, so no single one can both run authors' queries and change the engine's tables:
-      DB_USERNAME: order_query                 # the service: owns and writes the projections
+      # The service's one login (created by ./init/00_service_login.sql). Development credentials: in production
+      # supply them from a secret manager, not from a compose file.
+      DB_USERNAME: order_query
       DB_PASSWORD: order_query
-      QE_STORE_USERNAME: query_engine_owner    # the engine's own tables (query_engine schema)
-      QE_STORE_PASSWORD: qe_owner
-      QE_PROJECTION_USERNAME: query_engine_ro  # authors' queries: read-only
-      QE_PROJECTION_PASSWORD: qe_ro
     ports:
       - "8081:8081"
     depends_on:

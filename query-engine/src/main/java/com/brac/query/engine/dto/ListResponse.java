@@ -20,11 +20,18 @@ public record ListResponse(List<Item> items, String nextCursor) {
     ) {
     }
 
+    /**
+     * A query that is being worked on ({@code drafted} or {@code simulated}). {@code status} is
+     * {@code DRAFT} when its definition has errors and {@code VALIDATED} otherwise;
+     * {@code previouslyPublished} marks a query that was live and is offline while it is edited.
+     */
     public record DraftSummary(
             String status,
+            String state,
             boolean simulated,
             String author,
-            Instant updatedAt
+            Instant updatedAt,
+            boolean previouslyPublished
     ) {
     }
 }

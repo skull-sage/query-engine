@@ -55,6 +55,8 @@ export function wizardReducer(state, action) {
         revision: state.revision + 1,
         step: action.step,
         stepNotice: action.stepNotice || null,
+        // A query that was published before starts the publish step from the roles it had.
+        selectedRoles: state.selectedRoles.length ? state.selectedRoles : action.draft.allowedRoles || [],
       }
 
     case 'RESUME_EMPTY':
@@ -96,6 +98,7 @@ export function wizardReducer(state, action) {
         simulateError: null,
         publishError: null,
         paramValues: pickParamValues(params, state.paramValues),
+        selectedRoles: state.selectedRoles.length ? state.selectedRoles : action.draft.allowedRoles || [],
       }
     }
 

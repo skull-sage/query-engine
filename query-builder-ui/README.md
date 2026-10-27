@@ -8,8 +8,10 @@ allowed roles, and test-runs published queries the way a client app would.
 
 - **Header** — domain switcher (OrderQuery / InventoryQuery). The first visit asks for a domain; later visits reopen the last one.
   Switching domains unmounts the whole workspace (cancelling requests, closing dialogs) and loads the new domain's queries.
-- **Query list** (`/:domainKey`, the main view) — every query with an open draft and/or a published version, filtered by the
-  `All` / `Draft` / `Published` tabs (`?tab=draft|published`) and by name.
+- **Query list** (`/:domainKey`, the main view) — every query, each in exactly one state (drafted, simulated or published), filtered by
+  the `All` / `Draft` / `Published` tabs (`?tab=draft|published`) and by name. Editing a published query takes it offline: Edit asks for
+  confirmation first, and until the query is simulated and published again the list marks it "Offline · being edited" and callers get
+  `409 QUERY_NOT_PUBLISHED`. Discarding such a query deletes it.
 - **Query wizard** (dialog) — Draft → Simulate → Publish. "New query" opens it at Draft; a list item's Edit / Simulate /
   Publish opens the same dialog at that step for that query.
 - **Run dialog** — calls a published query through `POST /data-query`, choosing the identity (sent as `X-Roles`) from the

@@ -24,8 +24,8 @@
 --
 -- Column names are snake_case so they need no quoting in query templates.
 
--- Seeded as the administrator (docker-entrypoint-initdb.d), before the database logins exist; `./gradlew provision`
--- then lets the service login use and write these tables.
+-- Seeded as the administrator (docker-entrypoint-initdb.d), after 00_service_login.sql, and then granted to the
+-- service login at the end of this file: the service's event consumers write these tables.
 
 CREATE TABLE IF NOT EXISTS order_history_projection (
     order_id       VARCHAR(16)    NOT NULL PRIMARY KEY,
@@ -59,3 +59,6 @@ FROM (
 ON CONFLICT (order_id) DO NOTHING;
 
 ANALYZE order_history_projection;
+
+-- The service's login reads and writes this table.
+GRANT SELECT, INSERT, UPDATE, DELETE ON order_history_projection TO order_query;

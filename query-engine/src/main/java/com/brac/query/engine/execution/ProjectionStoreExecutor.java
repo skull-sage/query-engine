@@ -37,7 +37,7 @@ import java.util.concurrent.TimeoutException;
  * the rows piling up in memory. {@link #execute} is the bounded variant for callers that need a
  * list (simulate, JSON mode): it stops reading one row past its limit, which cancels the cursor.
  *
- * <p>Each run is wrapped in a read-only transaction ({@link ProjectionDatabase#inReadOnlyTransaction}),
+ * <p>Each run is wrapped in a read-only transaction ({@link ProjectionDatabaseClient#inReadOnlyTransaction}),
  * so a statement that would write fails in Postgres whatever the SQL says. That transaction is held
  * for as long as the stream is open, the same time the cursor already held the connection.
  *
@@ -51,10 +51,10 @@ public class ProjectionStoreExecutor {
 
     private static final Logger log = LoggerFactory.getLogger(ProjectionStoreExecutor.class);
 
-    private final ProjectionDatabase projection;
+    private final ProjectionDatabaseClient projectionDatabaseClient;
 
-    public ProjectionStoreExecutor(ProjectionDatabase projection) {
-        this.projection = projection;
+    public ProjectionStoreExecutor(ProjectionDatabaseClient projectionDatabaseClient) {
+        this.projectionDatabaseClient = projectionDatabaseClient;
     }
 
     /**
@@ -64,7 +64,7 @@ public class ProjectionStoreExecutor {
      */
     public Flux<Map<String, Object>> stream(String queryName, ValidatedQuery query, Map<String, Object> args, int fetchSize) {
         return Flux.defer(() -> {
-            DatabaseClient.GenericExecuteSpec spec = projection.client().sql(query.sql());
+            DatabaseClient.GenericExecuteSpec spec = projectionDatabaseClient.databaseClient().sql(query.sql());
             for (ParamSpec paramSpec : query.params()) {
                 Object value = coerce(queryName, paramSpec, args.get(paramSpec.name()));
                 spec = (value == null)
@@ -74,8 +74,8 @@ public class ProjectionStoreExecutor {
             if (fetchSize > 0) {
                 spec = spec.filter(statement -> statement.fetchSize(fetchSize));
             }
-            // The author's SQL only ever runs inside BEGIN READ ONLY (see ProjectionDatabase).
-            return projection.inReadOnlyTransaction(spec.map(ProjectionStoreExecutor::toRow).all());
+            // The author's SQL only ever runs inside BEGIN READ ONLY (see ProjectionDatabaseClient).
+            return projectionDatabaseClient.inReadOnlyTransaction(spec.map(ProjectionStoreExecutor::toRow).all());
         }).onErrorMap(ProjectionStoreExecutor::translate);
     }
 
@@ -110,11 +110,11 @@ public class ProjectionStoreExecutor {
      */
     public Mono<CheckResult> check(String queryName, ValidatedQuery query) {
         return Mono.defer(() -> {
-            DatabaseClient.GenericExecuteSpec spec = projection.client().sql("EXPLAIN " + query.sql());
+            DatabaseClient.GenericExecuteSpec spec = projectionDatabaseClient.databaseClient().sql("EXPLAIN " + query.sql());
             for (ParamSpec paramSpec : query.params()) {
                 spec = spec.bind(paramSpec.name(), sampleValue(paramSpec.type()));
             }
-            return projection.inReadOnlyTransaction(spec.fetch().all()).then(Mono.just(CheckResult.accepted()));
+            return projectionDatabaseClient.inReadOnlyTransaction(spec.fetch().all()).then(Mono.just(CheckResult.accepted()));
         }).onErrorResume(error -> {
             Throwable translated = translate(error);
             if (translated instanceof ProjectionException problem && problem.invalidSql()) {

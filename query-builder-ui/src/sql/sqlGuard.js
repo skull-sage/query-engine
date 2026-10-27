@@ -6,11 +6,12 @@
 // Both copies run query-engine/src/test/resources/sql-guard-cases.json; change the two together.
 //
 // Rules (error codes): SQL_UNTERMINATED, SQL_NOT_SELECT, SQL_MULTIPLE_STATEMENTS, SQL_DATA_MODIFYING,
-// SQL_SELECT_INTO, SQL_LOCKING_CLAUSE, SQL_FORBIDDEN_SCHEMA, SQL_FORBIDDEN_FUNCTION, SQL_UNSUPPORTED_SYNTAX.
+// SQL_SELECT_INTO, SQL_LOCKING_CLAUSE, SQL_FORBIDDEN_TABLE, SQL_FORBIDDEN_FUNCTION, SQL_UNSUPPORTED_SYNTAX.
 
 import { Kind, lex, location } from './sqlLexer.js'
 
-export const ENGINE_SCHEMA = 'query_engine'
+/** The engine's own table (stored queries with their SQL and allowed roles); author SQL may not name it. */
+export const ENGINE_TABLE = 'qe_stored_query'
 const MAX_ERRORS = 20
 
 /** Same list as the backend's default. If a deployment changes it, the server's answer wins. */
@@ -136,8 +137,8 @@ export function analyzeSql(sql, deniedFunctions = DEFAULT_DENIED_FUNCTIONS) {
         default:
       }
     }
-    if (isName(token) && next && isSymbol(next, '.') && token.text === ENGINE_SCHEMA) {
-      errors.push(error('SQL_FORBIDDEN_SCHEMA', `The '${ENGINE_SCHEMA}' schema belongs to the query engine and can't be queried${where}`))
+    if (isName(token) && token.text === ENGINE_TABLE) {
+      errors.push(error('SQL_FORBIDDEN_TABLE', `The '${ENGINE_TABLE}' table belongs to the query engine and can't be queried${where}`))
     }
     if (isName(token) && next && isSymbol(next, '(') && isDenied(token.text)) {
       errors.push(error('SQL_FORBIDDEN_FUNCTION', `Function '${token.text}' is not allowed${where}`))

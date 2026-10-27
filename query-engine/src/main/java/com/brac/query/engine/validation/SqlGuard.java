@@ -32,7 +32,7 @@ import java.util.regex.Pattern;
  *   <li>no INSERT, UPDATE, DELETE or MERGE anywhere, so none inside WITH either [SQL_DATA_MODIFYING];</li>
  *   <li>no {@code INTO} [SQL_SELECT_INTO];</li>
  *   <li>no {@code FOR UPDATE / SHARE / NO KEY UPDATE / KEY SHARE} [SQL_LOCKING_CLAUSE];</li>
- *   <li>no use of the {@code query_engine} schema [SQL_FORBIDDEN_SCHEMA];</li>
+ *   <li>no use of the engine's own table, {@code qe_stored_query} [SQL_FORBIDDEN_TABLE];</li>
  *   <li>no call to a denied function [SQL_FORBIDDEN_FUNCTION];</li>
  *   <li>no {@code U&"..."} names [SQL_UNSUPPORTED_SYNTAX].</li>
  * </ul>
@@ -52,12 +52,12 @@ public class SqlGuard {
     public static final String DATA_MODIFYING = "SQL_DATA_MODIFYING";
     public static final String SELECT_INTO = "SQL_SELECT_INTO";
     public static final String LOCKING_CLAUSE = "SQL_LOCKING_CLAUSE";
-    public static final String FORBIDDEN_SCHEMA = "SQL_FORBIDDEN_SCHEMA";
+    public static final String FORBIDDEN_TABLE = "SQL_FORBIDDEN_TABLE";
     public static final String FORBIDDEN_FUNCTION = "SQL_FORBIDDEN_FUNCTION";
     public static final String UNSUPPORTED_SYNTAX = "SQL_UNSUPPORTED_SYNTAX";
 
-    /** Schema that holds the engine's own tables; author SQL may not touch it. */
-    public static final String ENGINE_SCHEMA = "query_engine";
+    /** The engine's own table (stored queries, with their SQL and allowed roles); author SQL may not name it. */
+    public static final String ENGINE_TABLE = "qe_stored_query";
 
     private static final int MAX_ERRORS = 20;
     private static final Pattern PARAM_TOKEN = Pattern.compile(":([a-zA-Z_][a-zA-Z0-9_]*)");
@@ -178,9 +178,9 @@ public class SqlGuard {
                     }
                 }
             }
-            if (token.isName() && next != null && next.isSymbol('.') && ENGINE_SCHEMA.equals(token.text())) {
-                errors.add(error(FORBIDDEN_SCHEMA,
-                        "The '" + ENGINE_SCHEMA + "' schema belongs to the query engine and can't be queried" + where));
+            if (token.isName() && ENGINE_TABLE.equals(token.text())) {
+                errors.add(error(FORBIDDEN_TABLE,
+                        "The '" + ENGINE_TABLE + "' table belongs to the query engine and can't be queried" + where));
             }
             if (token.isName() && next != null && next.isSymbol('(') && isDenied(token.text())) {
                 errors.add(error(FORBIDDEN_FUNCTION, "Function '" + token.text() + "' is not allowed" + where));

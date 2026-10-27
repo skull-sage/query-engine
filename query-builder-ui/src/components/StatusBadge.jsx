@@ -3,6 +3,7 @@ const STYLES = {
   VALIDATED: 'bg-blue-100 text-blue-800',
   SIMULATED: 'bg-violet-100 text-violet-800',
   PUBLISHED: 'bg-emerald-100 text-emerald-800',
+  OFFLINE: 'bg-orange-100 text-orange-800',
   DISCARDED: 'bg-slate-100 text-slate-600',
 }
 
@@ -11,6 +12,7 @@ const LABELS = {
   VALIDATED: 'Draft · validated',
   SIMULATED: 'Draft · simulated',
   PUBLISHED: 'Published',
+  OFFLINE: 'Offline · being edited',
 }
 
 /** Small colored pill for a lifecycle status (DRAFT, VALIDATED, SIMULATED, PUBLISHED, ...). */

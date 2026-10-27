@@ -364,11 +364,11 @@ Numbers in angle brackets are starting points to be confirmed by the spike.
   body to a committed response. It is harmless but should be suppressed.
 - U6 (disconnect releases the connection): works. After killing 25 slow clients, all backends were back to `idle`. Aborting
   the browser-side request is logged as `outcome=cancelled`.
-- U7 (second ConnectionFactory): not needed. The projection pool lives inside `ProjectionDatabase` and is not exposed as a
+- U7 (second ConnectionFactory): not needed. The projection pool lives inside `ProjectionDatabaseClient` and is not exposed as a
   bean, so Boot's auto-configuration is untouched.
 - U8 (browser/proxy read-ahead): measured with a Node consumer through the Vite proxy (`localhost:5173`), 100 rows then 100 ms:
   ordered, no gaps, same read-ahead bound as above. A real browser was not used, so browser fetch internals are unverified.
-- U9 (`statement_timeout`): passed as a connection option through `ProjectionDatabase`. Later finding (2026-10-19): Postgres
+- U9 (`statement_timeout`): passed as a connection option through `ProjectionDatabaseClient`. Later finding (2026-10-19): Postgres
   applies it to the whole cursor read, not to each fetch, so every stream longer than the timeout (60 s default) is cancelled
   with `QUERY_TIMEOUT`, even when the client is healthy but slow. A 100,000-row run at 1,000 rows/s hit it at about 62 s. The
   4.5 table listing 60 s as a stream guard is therefore wrong for streams; it needs a separate decision (see PROGRESS.md, open
@@ -715,7 +715,7 @@ original reasoning.
   `DELETE FROM order_projection` therefore gets status `VALIDATED`.
 - Simulate executes the SQL for real, so such a draft would run at simulate time. (Read from the code, not tried.)
 - Published queries run the same way on `/data-query`.
-- The projection pool uses the service's own database user (`ProjectionDatabase` falls back to `spring.r2dbc.*`). In the dev
+- The projection pool uses the service's own database user (`ProjectionDatabaseClient` falls back to `spring.r2dbc.*`). In the dev
   containers that user is the Postgres superuser, so a query can also read or change the engine's own tables
   (`query_draft`, `published_query`) and call superuser-only functions.
 
@@ -729,7 +729,7 @@ A SQL checker alone can be bypassed, so the database is the real guarantee and t
    only, nothing on the engine tables, and `ALTER ROLE ... SET default_transaction_read_only = on`.
 2. The projection pool uses it through the existing `query-engine.projection.username` / `password` properties. The main pool
    (drafts, published queries, roles catalog) keeps its own user.
-3. `ProjectionDatabase` also adds `default_transaction_read_only=on` to the connection `options` it already sets for
+3. `ProjectionDatabaseClient` also adds `default_transaction_read_only=on` to the connection `options` it already sets for
    `statement_timeout`. It is applied once per pooled connection, so there is no per-query cost, and cursors / `fetchSize`
    work inside a read-only transaction.
 4. Map SQLSTATE `25006` (read-only transaction) and `42501` (insufficient privilege) in `ProjectionStoreExecutor.translate` to a
@@ -811,4 +811,4 @@ string literals (including `E'..'` escapes), quoted identifiers and dollar-quote
 4. A table allowlist (reject `query_draft`, `pg_catalog` and similar at draft time) needs a real parser; left out because the
    role's grants already cover it.
 5. Related, from the 77.8% halt: how `statement_timeout` should apply to streams (see `PROGRESS.md`, open issue 1). It is in
-   the same file (`ProjectionDatabase`) and best decided together.
+   the same file (`ProjectionDatabaseClient`) and best decided together.

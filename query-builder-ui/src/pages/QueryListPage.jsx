@@ -18,8 +18,8 @@ import { formatDateTime, formatRelative } from '../utils/format.js'
 const TAB_KEYS = ['all', 'draft', 'published']
 
 /**
- * The domain's main view: every query with an open draft and/or a published version, filtered by
- * the All / Draft / Published tabs. Drafting, simulating and publishing happen in
+ * The domain's main view: every query, each in exactly one state (drafted, simulated or published), filtered by
+ * the All / Draft / Published tabs. A query that was published and is being edited is a draft marked offline. Drafting, simulating and publishing happen in
  * QueryWizardModal; running a published query happens in RunQueryModal. The list reloads in the
  * background whenever a dialog closes, so it reflects whatever the dialog changed.
  */
@@ -31,7 +31,7 @@ export default function QueryListPage() {
 
   const [list, setList] = useState({ status: 'loading', items: [], error: null, refreshing: false, refreshError: null })
   const [search, setSearch] = useState('')
-  const [dialog, setDialog] = useState(null) // { kind: 'wizard', intent } | { kind: 'run', queryName } | { kind: 'discard', item }
+  const [dialog, setDialog] = useState(null) // { kind: 'wizard', intent } | { kind: 'run', queryName } | { kind: 'discard', item } | { kind: 'take-offline', item }
   const [discarding, setDiscarding] = useState(false)
   const [actionError, setActionError] = useState(null)
 
@@ -95,8 +95,9 @@ export default function QueryListPage() {
       case 'publish':
         setDialog({ kind: 'wizard', intent: { kind: 'edit', queryName: item.queryName, step: action === 'edit' ? 'draft' : action, fallbackEntry } })
         break
-      case 'new-draft':
-        setDialog({ kind: 'wizard', intent: { kind: 'edit', queryName: item.queryName, step: 'draft', fallbackEntry } })
+      case 'take-offline':
+        // Editing a published query takes it offline, so ask first. Nothing changes on the server until the first save.
+        setDialog({ kind: 'take-offline', item })
         break
       case 'run':
         setDialog({ kind: 'run', queryName: item.queryName })
@@ -212,6 +213,32 @@ export default function QueryListPage() {
         />
       )}
       {dialog?.kind === 'run' && <RunQueryModal queryName={dialog.queryName} onClose={closeDialog} />}
+      {dialog?.kind === 'take-offline' && (
+        <ConfirmDialog
+          title={`Edit ${dialog.item.queryName}?`}
+          confirmLabel="Continue to edit"
+          onCancel={() => setDialog(null)}
+          onConfirm={() => {
+            const published = dialog.item.published
+            setDialog({
+              kind: 'wizard',
+              intent: {
+                kind: 'edit',
+                queryName: dialog.item.queryName,
+                step: 'draft',
+                unpublish: true,
+                fallbackEntry: { sql: published.sql, params: paramListToMap(published.params), fetchSize: published.fetchSize },
+              },
+            })
+          }}
+        >
+          <p>
+            This query is published and in use. Saving a change takes it <strong>offline</strong>: callers get a &ldquo;being edited&rdquo; answer until
+            you simulate it again and publish it again.
+          </p>
+          <p className="mt-2">Nothing changes until you save. If you close the editor before saving, the query stays live.</p>
+        </ConfirmDialog>
+      )}
       {dialog?.kind === 'discard' && (
         <ConfirmDialog
           title={`Discard the draft for ${dialog.item.queryName}?`}
@@ -220,8 +247,8 @@ export default function QueryListPage() {
           onCancel={() => setDialog(null)}
           onConfirm={() => discard(dialog.item)}
         >
-          {dialog.item.published
-            ? 'The draft is deleted. The published version keeps serving callers.'
+          {dialog.item.draft?.previouslyPublished
+            ? 'This query was published and is offline while it is being edited. Discarding deletes it completely: callers will get "not found". To keep it, publish a corrected version instead.'
             : 'The draft is deleted. This query was never published, so it disappears from the list.'}
         </ConfirmDialog>
       )}
@@ -256,6 +283,7 @@ function QueryRow({ item, onAction }) {
         )}
         {draft && (
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-500">
+            {draft.previouslyPublished && <StatusBadge status="OFFLINE" />}
             <StatusBadge status={draftStatus} />
             <span title={formatDateTime(draft.updatedAt)}>
               saved {formatRelative(draft.updatedAt)} by {draft.author}
@@ -268,12 +296,12 @@ function QueryRow({ item, onAction }) {
       <div className="flex shrink-0 flex-wrap items-center gap-2">
         {draft && <DraftActions draftStatus={draftStatus} onAction={(a) => onAction(a, item)} />}
         {published && (
-          <Button size="sm" variant={draft ? 'secondary' : 'primary'} onClick={() => onAction('run', item)}>
+          <Button size="sm" variant="primary" onClick={() => onAction('run', item)}>
             Run
           </Button>
         )}
-        {published && !draft && (
-          <Button size="sm" onClick={() => onAction('new-draft', item)}>
+        {published && (
+          <Button size="sm" onClick={() => onAction('take-offline', item)}>
             Edit
           </Button>
         )}

@@ -22,18 +22,129 @@ This PRD is the concrete design for that foundation phase, specifically the work
 
 ## Query lifecycle
 
+*Revised 2026-10-26. This is the lifecycle the engine implements: one row per query, one table, one datasource. It replaces the
+earlier two-table model (a draft store plus a registry, in a `query_engine` schema, with a different database login for each). The
+sections further down that still talk about a draft store and a registry describe the same steps; read them with this section.*
+
+### One table, three states
+
+Every query is a single row of the table `qe_stored_query`, in the service's own database and schema, keyed by `query_name`. The
+engine creates the table on boot (`CREATE TABLE IF NOT EXISTS`, see "Table" below). The row's `state` is one of:
+
+| State | Meaning | Callable by `/data-query`? | Who may change it |
+| --- | --- | --- | --- |
+| `drafted` | Saved, not yet simulated successfully. The definition may be valid or carry errors (`errors` is non-empty). | No | The author who holds it (the lock) |
+| `simulated` | The current definition ran successfully against real data. Only this state can be published. | No | The author who holds it |
+| `published` | Live. Callers with an allowed role can invoke it. | Yes | Nobody, until someone takes it back to `drafted` on purpose |
+
 ```mermaid
 stateDiagram-v2
-    [*] --> DRAFT : draft (with errors)
-    [*] --> VALIDATED : draft succeeds
-    DRAFT --> VALIDATED : re-draft succeeds
-    VALIDATED --> DRAFT : re-draft with errors
-    VALIDATED --> VALIDATED : simulate (records simulated flag)
-    DRAFT --> [*] : discard
-    VALIDATED --> [*] : discard
-    VALIDATED --> PUBLISHED : publish (draft simulated)
-    PUBLISHED --> PUBLISHED : publish again\n(overwrites, no versioning)
+    [*] --> drafted : draft (new query)
+    drafted --> drafted : draft again (edit, fix errors)
+    drafted --> simulated : simulate succeeds
+    simulated --> drafted : draft again (any edit)
+    simulated --> simulated : simulate again
+    simulated --> published : publish (roles chosen here)
+    published --> drafted : draft with "unpublish": true (takes it offline)
+    drafted --> [*] : discard
+    simulated --> [*] : discard
 ```
+
+### Transitions
+
+The backend decides every transition. The UI only offers the buttons; it can never move a query to a state the rules forbid.
+
+| From | Action | To | Checked before it happens |
+| --- | --- | --- | --- |
+| (no row) | draft | `drafted` | Name is `{module}.{name}`; lexer and param checks; the database accepts the SQL (`EXPLAIN`, see Phase 1). Errors do not stop the save: the row is stored with `errors` set, and simulate stays locked |
+| `drafted`, `simulated` | draft again | `drafted` | Same author as the holder, otherwise `409 DRAFT_LOCKED`. Any edit clears `simulated`: a changed definition must be simulated again |
+| `drafted` (no errors), `simulated` | simulate | `simulated` | The row has no errors; the SQL guard passes again; params are present and typed. The SQL runs inside `BEGIN READ ONLY`. The state only moves if the row is unchanged since it was read (see "Concurrency") |
+| `simulated` | publish | `published` | At least one allowed role; the SQL guard passes again. The roles are stored with the row |
+| `published` | draft with `"unpublish": true` | `drafted` | Without the flag the request is refused (`409 QUERY_PUBLISHED`), so a live query is never taken offline by accident. The caller becomes the holder. The previous `allowed_roles` and `published_at` / `published_by` stay on the row |
+| `drafted`, `simulated` | discard | row deleted | See "Discard" below |
+| `published` | discard | refused | There is no way to delete a live query in this version; take it back to `drafted` first |
+
+Everything else is refused with the error that explains it:
+
+| Situation | Answer |
+| --- | --- |
+| Simulate or publish on a name that has no row, or that is `published` | `404 DRAFT_NOT_FOUND` (no open draft) |
+| Simulate on a draft with errors | `422 DRAFT_INVALID` |
+| Publish on a `drafted` row | `422 NOT_SIMULATED` |
+| Publish without roles | `422 NO_ALLOWED_ROLES` |
+| Simulate or publish on SQL that no longer passes the guard | `422 SQL_REJECTED` |
+| Another author drafts a row held by someone else | `409 DRAFT_LOCKED` |
+| Draft on a `published` query without `"unpublish": true` | `409 QUERY_PUBLISHED` |
+| The row changed between reading it and writing the new state | `409 DRAFT_CHANGED` |
+
+### Editing a published query
+
+Your decision (2026-10-26): a published query that needs a change is moved back to `drafted`, edited, and has to be simulated and
+published again. While that happens it is **offline**: there is no second, older copy that keeps serving.
+
+- The change is explicit. The UI's Edit on a published query asks for confirmation ("editing takes it offline for callers until you
+  publish it again") and sends `"unpublish": true` with the first save. Closing the dialog before saving changes nothing.
+- While the row is `drafted` or `simulated` but has been published before (`published_at` is set), `/data-query` answers
+  **`409 QUERY_NOT_PUBLISHED`** ("being edited by a@x.com, unavailable until it is published again"), not a `404`, so a caller can
+  tell "being edited" from "no such query". A query that was never published answers `404 QUERY_NOT_FOUND`.
+- Streams that already started finish normally; they hold the SQL they began with. Only new calls are refused.
+- Re-publishing needs the same steps as a first publish. The previous roles are offered again as the starting selection, and the
+  author still confirms them.
+
+### Discard
+
+Discard deletes the row. For a query that has never been published that is just removing a draft. For a query that was published
+before and is being edited, it deletes the query entirely, because the row is the only copy. The UI says so before it asks for
+confirmation. (If the history should survive, publish the corrected version instead.)
+
+### Concurrency
+
+The row carries a `revision` that every write increases. Simulate and publish read the row, do their work (which can take a while),
+and then change the state with a single conditional `UPDATE ... WHERE revision = <the one read> AND state = <the expected state>`.
+If someone saved a new draft in the meantime, that update changes nothing and the call answers `409 DRAFT_CHANGED`: a simulation
+of the old definition can never mark a changed one as simulated, and publish can never publish what was not simulated. Saving a draft
+is likewise one conditional upsert (same holder, or an explicit unpublish), so two authors cannot both win the lock.
+
+### Reading while editing
+
+`/engine/list` returns one item per query with its single state. A `drafted` or `simulated` row that has been published before is
+marked `previouslyPublished`, which the UI shows as "offline, being edited". `/query-roles` is no longer stored: the roles and
+groups catalog comes from configuration (`query-engine.roles`, with built-in defaults).
+
+### Table
+
+```sql
+CREATE TABLE IF NOT EXISTS qe_stored_query (
+    query_name      VARCHAR(255) NOT NULL PRIMARY KEY,           -- {module}.{name}
+    state           VARCHAR(16)  NOT NULL CHECK (state IN ('drafted', 'simulated', 'published')),
+    sql_text        TEXT         NOT NULL,
+    params          JSONB        NOT NULL,                       -- declared types as written
+    fetch_size      INT,                                         -- optional rows per round trip; null = service default
+    validated_query JSONB,                                       -- null while the definition has errors
+    errors          JSONB        NOT NULL,                       -- [] when valid
+    allowed_roles   JSONB        NOT NULL,                       -- set at publish, kept for the next publish
+    author          VARCHAR(255) NOT NULL,                       -- the holder while drafted / simulated
+    revision        BIGINT       NOT NULL,
+    updated_at      TIMESTAMPTZ  NOT NULL,
+    published_at    TIMESTAMPTZ,                                 -- set once published; never cleared
+    published_by    VARCHAR(255)
+);
+```
+
+The file contains only this `CREATE`. It never alters an existing table, so a change of shape means a new table name or a manual
+migration chosen deliberately, not a startup side effect.
+
+### Execution and safety
+
+- One datasource: the service's own `spring.r2dbc.*` login does everything. There are no separate engine or read-only logins and no
+  provisioning step.
+- Author SQL (simulate, `/data-query`, and the draft-time `EXPLAIN` check) always runs on a dedicated connection pool built from the
+  same datasource, inside an explicit `BEGIN READ ONLY` transaction. Postgres then refuses every write, DML or DDL, also from inside
+  a stored function. The engine's own bookkeeping writes use the service's normal pool and never run author SQL.
+- The SQL lexer still runs at draft, simulate, publish and call time. It also rejects any reference to `qe_stored_query`
+  (`SQL_FORBIDDEN_TABLE`), so author SQL cannot read other queries' SQL or roles.
+- Startup refuses a superuser login (it would ignore permissions) and runs a self-test that author SQL really is read-only; see
+  `docs/security_protocol.md`.
 
 ## Query definition format (YAML)
 
@@ -126,62 +237,52 @@ Because `sql` is text the query registry service doesn't parse, the Read Engine 
 
 ## Current implementation (as built)
 
-What the code does today (query-engine `0.0.1-SNAPSHOT`, 2026-10-17). The design sections around this one describe the intended shape; where they disagree with this section, this section reflects the code. The gaps are listed in "Differences between the design and the code" at the end of this section.
+What the code does today (query-engine `0.0.1-SNAPSHOT`, 2026-10-27). The design sections around this one describe the intended shape; where they disagree with this section, this section reflects the code. The gaps are listed in "Differences between the design and the code" at the end of this section.
 
 ### Where it lives
 
-`query-engine` is a library, not an application. Each domain query service (`order-query` on 8081, `inventory-query` on 8082) embeds it through `QueryEngineAutoConfiguration`, which registers the endpoints below and creates the engine's own tables in the `query_engine` schema of the service's database on startup (`query-engine/schema.sql`, idempotent). The service supplies its `spring.r2dbc.*` connection and its projection tables; the engine opens two more pools of its own, one for its tables and one for author queries, each of which logs in as a different database user so that published SQL can only read (see `docs/security_protocol.md`). Everything is reactive (WebFlux controller, then service, then R2DBC `DatabaseClient`), and no query lifecycle state is held in memory.
-
+`query-engine` is a library, not an application. Each domain query service (`order-query` on 8081, `inventory-query` on 8082) embeds it through `QueryEngineAutoConfiguration`, which registers the endpoints below and creates the engine's one table, `qe_stored_query`, in the service's own database on boot (`query-engine/schema.sql`, a single `CREATE TABLE IF NOT EXISTS`). The service supplies its `spring.r2dbc.*` datasource and its projection tables; the engine uses that datasource for everything and has no database settings of its own. Author SQL runs on a second pool of the same datasource, always inside `BEGIN READ ONLY` (see `docs/security_protocol.md`). Everything is reactive (WebFlux controller, then service, then R2DBC `DatabaseClient`), and no query lifecycle state is held in memory. The lifecycle itself is described in "Query lifecycle" near the top of this document.
 | Piece | Class (package `com.brac.query.engine`) | Job |
 | --- | --- | --- |
 | Endpoints | `web.EngineController`, `web.DataQueryController`, `web.QueryRolesController` | `/engine/*`, `/data-query`, `/query-roles` |
 | Error mapping | `web.GlobalExceptionHandler`, `error.EngineException` | One JSON error shape `{ error, message, queryName }` |
-| Lifecycle | `service.QueryEngineService` | Draft, simulate, publish, discard, list, invoke |
+| Lifecycle service | `service.QueryEngineService` | Draft, simulate, publish, discard, list, invoke preparation |
+| Lifecycle rules | `service.QueryLifecycle` | The rules for each step as plain functions (who may draft over what, what simulate and publish need, what `/data-query` may run); unit tested |
 | Validator | `validation.QueryValidator` | Runs the SQL checks, then checks `:param` tokens against declared params; builds `ValidatedQuery` |
-| SQL checks | `validation.SqlLexer`, `validation.SqlGuard` | Tokenizes the SQL; rejects anything that is not a single read-only SELECT; finds the `:param` tokens |
-| Engine pool | `store.EngineDatabase` | Own pool and transaction for the tables below, logging in as `query_engine_owner` |
-| Draft store | `store.DraftStore` | Table `query_engine.drafted_query` |
-| Registry | `store.PublishedQueryRepository` | Table `query_engine.published_query` |
-| Identity catalog | `store.QueryRolesRepository` | Tables `query_engine.realm_role`, `query_engine.realm_group` |
-| Executor | `execution.ProjectionStoreExecutor` | Runs the SQL template against the domain's projection tables, on the `query_engine_ro` pool, inside a read-only transaction |
-| Startup check | `security.SecurityStartupCheck` | Refuses to start if the two logins are not separate and read-only as required; audits stored queries |
+| SQL checks | `validation.SqlLexer`, `validation.SqlGuard` | Tokenizes the SQL; rejects anything that is not a single read-only SELECT and any use of `qe_stored_query`; finds the `:param` tokens |
+| Store | `store.StoredQueryRepository` | Table `qe_stored_query`; every state change is one conditional statement |
+| Identity catalog | `store.QueryRolesCatalog`, `config.RolesProperties` | Roles and groups for `/query-roles`, from `query-engine.roles` or built-in demo defaults |
+| Executor | `execution.ProjectionStoreExecutor`, `execution.ProjectionDatabaseClient` | Runs the SQL template on the dedicated author-SQL pool, inside a read-only transaction |
+| Startup check | `security.SecurityStartupCheck` | Read-only self-test (always), refuses a superuser login (`enforce`), audits stored queries |
 | JSONB codec | `store.JsonbSupport` | Reads and writes JSONB columns as r2dbc-postgresql `Json` |
-
 ### How a query is handled
 
 **Draft** (`POST /engine/draft`, or `/engine/draft-yml` for YAML bodies; both run the same logic)
 1. `queryName` must match `^[a-zA-Z0-9_]+\.[a-zA-Z0-9_]+$` (`{module}.{name}`), otherwise `400 INVALID_QUERY_NAME`.
-2. Lock check: a draft held by a different `X-Author` gives `409 DRAFT_LOCKED`.
-3. Validation: `SqlGuard` tokenizes `sql` (skipping strings, quoted names and comments) and checks it is a single read-only SELECT; problems are `SQL_*` entries in `errors` (`SQL_NOT_SELECT`, `SQL_MULTIPLE_STATEMENTS`, `SQL_DATA_MODIFYING`, `SQL_FORBIDDEN_FUNCTION` and so on, listed in `docs/security_protocol.md`). It also finds the `:param` tokens, which are compared with the declared `params`: `UNDECLARED_PARAM`, `UNUSED_PARAM`, `UNKNOWN_PARAM_TYPE` or `MISSING_SQL`. Casts such as `x::text` and colons inside strings are not parameters. When those checks pass, the engine also asks Postgres whether it accepts the SQL: it plans the statement with `EXPLAIN` (never executed), binding each param with a neutral sample value of its declared type, inside the same read-only transaction. A rejection (syntax error, unknown table, column or function, type mismatch; SQLSTATE class 42, 22 or 0A) is stored as `SQL_INVALID` with Postgres's own message, so the draft is `DRAFT` and cannot be simulated or published. If the database cannot be reached for the check, the draft is saved unchecked, the response carries a `warnings` entry `SQL_NOT_CHECKED` (the UI shows it), and simulate reports the real result.
-4. With errors, the draft is stored with `status = DRAFT` and `validated_query = NULL`. Without errors it is `VALIDATED` and carries a `ValidatedQuery { sql, params: [{ name, type }], allowedRoles }`.
-5. The draft is always stored (upsert by `query_name`), even with errors, with `simulated = false`. Drafts do not expire. The response returns the status, errors, validated descriptor, the submitted `entry { sql, params }` and `simulated`.
-
+2. Lifecycle check (see "Query lifecycle"): a row held by a different `X-Author` gives `409 DRAFT_LOCKED`; a `published` query gives `409 QUERY_PUBLISHED` unless the body has `"unpublish": true`, in which case it goes back to `drafted` and is offline.
+3. Validation: `SqlGuard` tokenizes `sql` (skipping strings, quoted names and comments) and checks it is a single read-only SELECT; problems are `SQL_*` entries in `errors` (`SQL_NOT_SELECT`, `SQL_MULTIPLE_STATEMENTS`, `SQL_DATA_MODIFYING`, `SQL_FORBIDDEN_TABLE`, `SQL_FORBIDDEN_FUNCTION` and so on, listed in `docs/security_protocol.md`). It also finds the `:param` tokens, which are compared with the declared `params`: `UNDECLARED_PARAM`, `UNUSED_PARAM`, `UNKNOWN_PARAM_TYPE` or `MISSING_SQL`. Casts such as `x::text` and colons inside strings are not parameters. When those checks pass, the engine also asks Postgres whether it accepts the SQL: it plans the statement with `EXPLAIN` (never executed), binding each param with a neutral sample value of its declared type, inside a read-only transaction. A rejection (syntax error, unknown table, column or function, type mismatch; SQLSTATE class 42, 22 or 0A) is stored as `SQL_INVALID` with Postgres's own message, so the draft has errors and cannot be simulated or published. If the database cannot be reached for the check, the draft is saved unchecked, the response carries a `warnings` entry `SQL_NOT_CHECKED` (the UI shows it), and simulate reports the real result.
+4. With errors, the row is stored with `errors` set and `validated_query = NULL` (the API calls this `status = DRAFT`). Without errors it is `status = VALIDATED` and carries a `ValidatedQuery { sql, params: [{ name, type }], allowedRoles }`.
+5. The row is always stored (one conditional upsert by `query_name`), even with errors, in state `drafted`. The response returns `status`, `state`, errors, the validated descriptor, the submitted `entry { sql, params, fetchSize }`, `simulated`, `previouslyPublished`, the last-chosen `allowedRoles` and `warnings`.
 **Simulate** (`POST /engine/simulate`)
-1. Loads the draft (`404 DRAFT_NOT_FOUND` if missing). A `DRAFT`-status draft gives `422 DRAFT_INVALID`. The SQL is checked again; a failure is `422 SQL_REJECTED`.
+1. Loads the row (`404 DRAFT_NOT_FOUND` if it does not exist or is `published`). A draft with errors gives `422 DRAFT_INVALID`. The SQL is checked again; a failure is `422 SQL_REJECTED`.
 2. Checks the supplied params against the validated list: every declared param must be present and type-compatible, otherwise `400 INVALID_ARGUMENT`.
-3. Executes the SQL template against the projection tables (see "Executor" below) in a read-only transaction. Simulate is capped at 200 rows (`query-engine.simulate.max-rows`).
-4. Saves the draft with `simulated = true`.
+3. Executes the SQL template against the projection tables (see "Executor" below) in a read-only transaction. A rejection by the database of the SQL itself (a syntax error, or a failure that only happens on real rows such as a division by zero) is `422 SQL_INVALID`. Simulate is capped at 200 rows (`query-engine.simulate.max-rows`).
+4. Moves the row to `simulated` with one conditional update that only applies if the row is still at the revision that was read; otherwise `409 DRAFT_CHANGED`.
 5. Returns the rows, `rowCount`, `truncated` and `metrics { latencyMs, rowsScanned, planCost }`. Only `latencyMs` is measured. `rowsScanned` is the number of rows returned, and `planCost` is a random placeholder, not a PostgreSQL planner figure. `redactedFields` is always empty.
-
 **Publish** (`POST /engine/publish`, body `{ queryName, allowed_roles }`)
-1. Loads the draft. Not simulated gives `422 NOT_SIMULATED`. The SQL is checked again; a failure is `422 SQL_REJECTED`.
-2. `allowed_roles` are taken from the publish request (trimmed, blanks dropped, de-duplicated); none left gives `422 NO_ALLOWED_ROLES`. They replace whatever the draft carried. An `allowed_roles` field on the draft body is still accepted and stored on the draft, but publish ignores it.
-3. Upserts `published_query` with the chosen roles and deletes the draft in one transaction on the engine's pool (`EngineDatabase.inTransaction`), so both happen or neither does. Checked by making the draft delete fail: nothing was published and the draft stayed.
+1. Loads the row. Not `simulated` gives `422 NOT_SIMULATED`; errors give `422 DRAFT_INVALID`. The SQL is checked again; a failure is `422 SQL_REJECTED`.
+2. `allowed_roles` are taken from the publish request (trimmed, blanks dropped, de-duplicated); none left gives `422 NO_ALLOWED_ROLES`. An `allowed_roles` field on the draft body is still accepted but publish ignores it.
+3. Moves the row to `published` with one conditional update (state `simulated` and the revision that was read); otherwise `409 DRAFT_CHANGED`. The roles go into both `allowed_roles` and the descriptor the role gate reads.
 4. Returns `201 { queryName, status: "PUBLISHED", publishedAt, publishedBy }`, where `publishedBy` is the `X-Author` header.
-
-**Discard** (`POST /engine/discard`) loads the draft (`404` if missing) and deletes it. A published version of the same name is untouched.
-
-**List** (`POST /engine/list`) reads every `published_query` row and every `drafted_query` row, merges them by `queryName` in name order, and returns `{ published, draft }` per name (either can be `null`). Filters: `module`, `queryNamePrefix`, `status`, and `author` (matches drafts only). `page.size` defaults to 50 (max 200). `page.cursor` is ignored.
-
+**Discard** (`POST /engine/discard`) loads the row (`404 DRAFT_NOT_FOUND` if it does not exist or is `published`) and deletes it. For a query that was published and is being edited this deletes the query entirely.
+**List** (`POST /engine/list`) reads every row and returns one item per query in name order, `{ published, draft }` with exactly one of them set: `published` for a `published` row, `draft` (with `status`, `state`, `simulated`, `author`, `updatedAt`, `previouslyPublished`) for the others. Filters: `module`, `queryNamePrefix`, `status`, and `author` (matches drafts only). `page.size` defaults to 50 (max 200). `page.cursor` is ignored.
 **Invoke** (`POST /data-query`, body `{ name, params }`, caller roles in the `X-Roles` header)
-1. A name containing `.` is used as is. A bare name must match exactly one published name by suffix, otherwise `404 QUERY_NOT_FOUND`.
-2. Loads the published query (`404 QUERY_NOT_FOUND` if missing).
+1. A name containing `.` is used as is. A bare name must match exactly one name that is or was published, by suffix, otherwise `404 QUERY_NOT_FOUND`.
+2. Loads the row. No row, or never published: `404 QUERY_NOT_FOUND`. Published before but now `drafted` or `simulated` (being edited): `409 QUERY_NOT_PUBLISHED`.
 3. Role gate: the comma-separated `X-Roles` values (default `senior_DBA` when the header is absent) must include at least one of the query's `allowedRoles`, by exact string match. Realm roles and groups share one name space. Otherwise `403 FORBIDDEN`.
 4. The stored SQL is checked again (`422 SQL_REJECTED`, with only the codes in the message; the detail is logged), then the params as in simulate (`400 INVALID_ARGUMENT`).
-5. Executes the SQL and returns a JSON array of rows, capped at 200, with no signal when rows were dropped. The response is fully buffered; see `docs/reactive_R2DBC_Cursor-impl.md` for the streaming plan.
-
-**Identity catalog** (`GET /query-roles`) returns `{ realmRoles: [{ name, description }], groups: [{ name, path, description }] }` from the two catalog tables. The UI uses it to choose `allowed_roles` at publish time and a calling identity at run time.
-
+5. Executes the SQL in a read-only transaction. `Accept: application/x-ndjson` streams every row, one per line, read from Postgres only as fast as the client reads; `application/json` (the default) returns an array of at most 1000 rows and `413 RESULT_TOO_LARGE` beyond that. See `docs/reactive_R2DBC_Cursor-impl.md`.
+**Identity catalog** (`GET /query-roles`) returns `{ realmRoles: [{ name, description }], groups: [{ name, path, description }] }` from configuration (`query-engine.roles`, or the built-in demo catalog). The UI uses it to choose `allowed_roles` at publish time and a calling identity at run time. It grants nothing.
 ### Parameter types
 
 Types are declared as text in `params` (case-insensitive) and resolved to `ParamType`.
@@ -201,50 +302,18 @@ Types are declared as text in `params` (case-insensitive) and resolved to `Param
 `ProjectionStoreExecutor` hands the stored SQL template to `DatabaseClient.sql(...)`. The `:name` markers are bound by name through the driver's native parameter binding (translated to `$N`), so argument values are never concatenated into the SQL. A missing value is bound as a typed null. Rows come back as `LinkedHashMap<column, value>`, with Postgres lower-casing unquoted column names (`orderId` comes back as `orderid`). Simulate and invoke both use this one method, which today reads the full result set into a list before applying the 200-row cap.
 
 ### Database tables
-
-Each domain service has its own database. It contains the engine's four tables in the `query_engine` schema (created by `schema.sql`, owned by `query_engine_owner`) plus that domain's projection tables in `public`. Every statement names the schema. `docs/security_protocol.md` has the logins, grants and the script that moves an older database.
-
-**`query_engine.drafted_query`** (the draft store; one open draft per query; called `query_draft` before the schema move)
-
-| Column | Type | Notes |
-| --- | --- | --- |
-| `query_name` | `VARCHAR(255)` PK | `{module}.{name}` |
-| `sql_text` | `TEXT` | SQL template exactly as submitted |
-| `params` | `JSONB` | Declared types as the author wrote them, e.g. `{"status":"String","branchId":"int"}` |
-| `allowed_roles` | `JSONB` | Legacy: whatever the draft body carried, normally JSON `null`. Not used by publish |
-| `validated_query` | `JSONB`, nullable | `{ "sql": "...", "params": [{ "name": "status", "type": "STRING" }], "allowedRoles": [] }`; SQL `NULL` when `status = DRAFT` |
-| `status` | `VARCHAR(32)` | `DRAFT` (has errors) or `VALIDATED` |
-| `errors` | `JSONB` | `[{ "code": "UNDECLARED_PARAM", "param": "branchId", "message": "…" }]`, empty array when valid |
-| `simulated` | `BOOLEAN` | `false` after every draft save, `true` after a successful simulate |
-| `author` | `VARCHAR(255)` | `X-Author` of the last saver; the lock holder |
-| `updated_at` | `TIMESTAMPTZ` | set by draft and simulate. Drafts have no expiry; the old `expires_at` column is dropped on startup |
-
-**`query_engine.published_query`** (the registry; one live version per query, no history)
-
-| Column | Type | Notes |
-| --- | --- | --- |
-| `query_name` | `VARCHAR(255)` PK | Same name space as drafts |
-| `sql_text` | `TEXT` | Copied from the draft |
-| `params` | `JSONB` | Declared types, copied from the draft |
-| `allowed_roles` | `JSONB` | Roles/groups chosen at publish, e.g. `["data_analyst","finance"]` |
-| `validated_query` | `JSONB` NOT NULL | Same shape as in `drafted_query`; `allowedRoles` holds the roles chosen at publish. The role gate and the list read this copy |
-| `published_at`, `published_by` | `TIMESTAMPTZ`, `VARCHAR(255)` | When and by whom (`X-Author`) |
-
-**`query_engine.realm_role`** (`name` PK, `description`) and **`query_engine.realm_group`** (`name` PK, `path`, `description`) are the identity catalog behind `/query-roles`. They are seeded by `schema.sql` (8 roles, 7 groups). In a real deployment they would mirror the enterprise identity provider.
-
-Who touches the tables:
-
+Each domain service has its own database. It contains the engine's one table, `qe_stored_query` (created by `schema.sql` on boot with the service's own login), plus that domain's projection tables. The table's definition and the meaning of each column are in "Query lifecycle" above; the file contains a single `CREATE TABLE IF NOT EXISTS` and never an `ALTER`. `docs/security_protocol.md` has the login guidance.
+Who touches the table:
 | Operation | Reads | Writes |
 | --- | --- | --- |
-| draft / draft-yml | `drafted_query` (lock check) | `drafted_query` (upsert) |
-| drafted | `drafted_query` | none |
-| simulate | `drafted_query`, projection tables | `drafted_query` (`simulated`, `updated_at`) |
-| publish | `drafted_query` | `published_query` (upsert), `drafted_query` (delete) |
-| discard | `drafted_query` | `drafted_query` (delete) |
-| list | `drafted_query`, `published_query` | none |
-| `/data-query` | `published_query`, projection tables | none |
-| `/query-roles` | `realm_role`, `realm_group` | none |
-
+| draft / draft-yml | the row (lock and state check) | one conditional upsert |
+| drafted | the row | none |
+| simulate | the row, projection tables (read-only transaction) | one conditional update to `simulated` |
+| publish | the row | one conditional update to `published` |
+| discard | the row | delete (drafted or simulated rows only) |
+| list | all rows | none |
+| `/data-query` | the row, projection tables (read-only transaction) | none |
+| `/query-roles` | none (configuration) | none |
 **Projection tables** are the domain's read models, owned by each domain service and seeded by its `docker/init` scripts. They are flat, denormalized and keyed by a business id, with filterable columns the published SQL selects on:
 
 | Service | Table | Shape |
@@ -256,11 +325,11 @@ A 50,000-row `order_history_projection` for the streaming demo exists in `order-
 
 ### Known limitations as built
 
-- Published SQL is read-only by construction: it must pass the SQL checks (single SELECT, no writes, no denylisted functions, no `query_engine` schema), it runs as `query_engine_ro` and it runs in `BEGIN READ ONLY`. The checks read text and cannot see inside a function; the login and the transaction are what stop writes. `query_engine_ro` has `pg_read_all_data`, so with the checks switched off it can read the engine's tables. See `docs/security_protocol.md`.
+- Published SQL is read-only by construction, in two layers: it must pass the SQL checks (single SELECT, no writes, no denylisted functions, no `qe_stored_query`), and it runs in `BEGIN READ ONLY` on a dedicated pool, which Postgres enforces whatever the SQL says (also inside stored functions). The checks read text and cannot see inside a function; the transaction is what stops writes. The login is the service's own and can read `qe_stored_query`, so only the checks keep author SQL away from the stored queries. See `docs/security_protocol.md`.
 - A column literally named `insert`, `update`, `delete` or `merge` must be quoted in the SQL.
 - Malformed `date` / `datetime` / number strings are rejected at call time as `400 INVALID_ARGUMENT`.
 - Simulate metrics are placeholders (see Simulate above).
-- Drafts never expire. A draft keeps its author's lock until it is published or discarded, so a draft left behind by someone else blocks other authors from drafting that `queryName` until it is discarded (any caller can discard, see below).
+- Drafts never expire. A draft keeps its author's lock until it is published or discarded, so a draft left behind by someone else blocks other authors from drafting that `queryName` until it is discarded (any caller can discard, see below). A published query that is being edited is offline until it is published again.
 - Caller identity is a stand-in: `X-Author` on `/engine/*` (default `anonymous`) and `X-Roles` on `/data-query` (default `senior_DBA`). There is no authentication.
 - Publishing is not author-checked: any caller can simulate, publish or discard any draft. Only a second `draft` call is blocked by the lock.
 
@@ -271,12 +340,13 @@ A 50,000-row `order_history_projection` for the streaming demo exists in `order-
 | Queries live in `{module}_sql.yml` files with `allowed_roles` in the YAML | Queries are authored one at a time through the API or UI as `queryName`, `sql`, `params`. `allowed_roles` are chosen at publish |
 | `allowed_roles` declared at draft time; publish takes `{ queryName }` | Publish requires `allowed_roles` (`422 NO_ALLOWED_ROLES` otherwise) |
 | `enum(A, B, ...)` param type | Not implemented; seven types only (table above) |
-| Only the draft's author can simulate, publish or discard; `chief_DBA` can force-discard | Not enforced (see limitations) |
+| Only the draft's author can simulate, publish or discard; `chief_DBA` can force-discard | Not enforced (see limitations). Only a second `draft` call is blocked by the lock |
 | Drafts expire after a TTL; a scheduled sweeper deletes them with a `DRAFT_EXPIRED` audit entry | Dropped on purpose: drafts never expire and there is no sweeper |
-| Simulation under a cost limiter with timeout and `EXPLAIN`, plus OPA redaction | Row cap of 200 only; no timeout, `EXPLAIN` or OPA. The SQL runs read-only |
+| Simulation under a cost limiter with timeout and `EXPLAIN`, plus OPA redaction | Row cap of 200 and the statement timeout; `EXPLAIN` is used at draft time to check the SQL, not to limit cost; no OPA. The SQL runs read-only |
 | `list` supports `filter.author = "me"` and `page.cursor` | `"me"` is not special; cursor ignored |
 | Phase 2: JWT, published-query cache and change events, OPA, jOOQ binder, arity, NDJSON streaming, `X-Next-Cursor` / `X-Redacted-Fields` | JWT, cache, OPA, jOOQ binder, arity, `X-Next-Cursor` / `X-Redacted-Fields` are not built. Roles come from `X-Roles`; each call reads the registry. NDJSON streaming with backpressure is built (`Accept: application/x-ndjson`; JSON is capped at 1000 rows with `413`); see `docs/reactive_R2DBC_Cursor-impl.md` |
 | Authoring role precondition for Phase 1 | Not enforced |
+| A draft store and a separate query registry, with a published version that keeps serving while an edit is drafted | One table, one row per query. Editing a published query takes it offline until it is simulated and published again (see "Query lifecycle") |
 
 ---
 
@@ -307,28 +377,23 @@ Content type is JSON by default across every endpoint. The one exception is draf
 `queryName` is always the first field of the body and is the lookup key into the Draft Store; the body never repeats the SQL or the validated descriptor after drafting. Resume is a `POST` rather than a `GET` so the query name stays in the body, not the URL.
 
 ### How drafting stores the draft
-
-`draft` (JSON) and `draft-yml` (YAML) are the only calls that accept query content; both run the exact same validate/store logic underneath, just parsing a different body format first. On success *or* failure the engine writes a server-side **draft record** to the Draft Store, keyed by `queryName`:
-
-| Draft field | Notes |
+*Superseded by "Query lifecycle" near the top of this document, which describes the single `qe_stored_query` row and its three states. The summary below is kept for reference.*
+`draft` (JSON) and `draft-yml` (YAML) are the only calls that accept query content; both run the exact same validate/store logic underneath, just parsing a different body format first. On success *or* failure the engine writes the query's row, keyed by `queryName`, in state `drafted`:
+| Field | Notes |
 | --- | --- |
-| `queryName` | Primary key — `{module}.{name}`, taken from the `queryName` field of the draft body. At most one open draft per `queryName`. |
-| `entry` | The submitted YAML-equivalent entry, verbatim. |
+| `queryName` | Primary key, `{module}.{name}`. At most one row per `queryName`. |
+| `entry` | The submitted entry, verbatim (`sql_text`, `params`, `fetch_size`). |
 | `validatedQuery` | The `ValidatedQuery` descriptor, or `null` if validation failed. |
-| `status` | `DRAFT` (validation errors) or `VALIDATED` (no errors). |
-| `errors` | Load-time errors from the last draft call. |
-| `simulated` | `true` once a simulate against this draft has succeeded; reset to `false` on every re-draft. |
-| `author` | The `X-Author` of the last saver. Another author's `draft` call is blocked while the draft is open; simulate, publish and discard are not author-checked yet. |
-| `updatedAt` | Set on every draft and simulate call. There is no expiry. |
-
-Rules that follow from this record:
-
-- `simulate`, `publish`, and `discard` always operate on the stored draft for the `queryName` in the body, never on a payload the client sends back.
-- `simulate` is rejected with `422 DRAFT_INVALID` if the draft is `DRAFT` (has validation errors), and with `400 INVALID_ARGUMENT` if a required param is missing or has the wrong type — see "Param validation" below.
-- `publish` is rejected with `422 NOT_SIMULATED` unless the draft has been simulated. Re-drafting resets `simulated` to `false`, so re-drafting after a simulation forces a fresh simulation before publish.
-- A `draft` call from a different author while a draft is open returns `409 DRAFT_LOCKED` (with the holder), so two authors can't silently overwrite each other.
-- Drafting a `queryName` that is already published opens a draft that will replace it on publish; the published query keeps serving traffic untouched until then.
-
+| `errors` | Validation errors of the last draft call; the API reports `status = DRAFT` when there are any, `VALIDATED` otherwise. |
+| `state` | `drafted`, then `simulated` after a successful simulate, then `published`. Every re-draft sets it back to `drafted`. |
+| `author` | The `X-Author` of the last saver: the lock holder while drafted or simulated. |
+| `updatedAt`, `revision` | Set on every write. There is no expiry. |
+Rules that follow from this row:
+- `simulate`, `publish`, and `discard` always operate on the stored row for the `queryName` in the body, never on a payload the client sends back.
+- `simulate` is rejected with `422 DRAFT_INVALID` if the draft has validation errors, and with `400 INVALID_ARGUMENT` if a required param is missing or has the wrong type, see "Param validation" below.
+- `publish` is rejected with `422 NOT_SIMULATED` unless the row is `simulated`. Re-drafting sets it back to `drafted`, so re-drafting after a simulation forces a fresh simulation before publish.
+- A `draft` call from a different author while the row is `drafted` or `simulated` returns `409 DRAFT_LOCKED` (with the holder), so two authors can't silently overwrite each other.
+- Drafting a `queryName` that is `published` is refused with `409 QUERY_PUBLISHED` unless the request says `"unpublish": true`; then the query goes back to `drafted` and is offline until it is published again.
 ### Param validation
 
 Two different checks catch bad params, at two different points in the lifecycle:
@@ -390,20 +455,10 @@ sequenceDiagram
 ```
 
 ### What happens if the frontend never calls publish or discard
-
-A draft is never callable. `POST /data-query` reads only from the Published Query Store, and drafts live in the Draft Store, so a forgotten draft has no runtime effect:
-
-- **Brand-new query**: `queryName` doesn't exist for callers; `/data-query` returns `404 QUERY_NOT_FOUND`.
-- **Edit to a published query**: callers keep getting the published query untouched. The edit simply never ships.
-
-What the open draft *does* hold is the per-`queryName` lock and storage:
-
-- **Same author comes back** (new tab, browser crash, next day): `POST /engine/drafted` with `{ queryName }` returns the stored entry and the author continues with simulate, publish, or discard. Calling `draft` again also works — it overwrites the draft in place.
-- **Different author** tries to draft the same `queryName`: gets `409 DRAFT_LOCKED` with the holder. A user with the `chief_DBA` role can force-discard the draft.
-- **Nobody comes back**: nothing happens. Drafts do not expire, so the draft and its lock stay until someone publishes or discards it (an earlier design had a 7-day TTL and a sweeper; both were removed). `discard` releases the lock.
-
-`discard` is the only way to release a draft that will not be published, since there is no expiry.
-
+A query that is `drafted` or `simulated` is never callable: `POST /data-query` only runs a `published` row, so a forgotten draft has no runtime effect on a query that was never published (`404 QUERY_NOT_FOUND`). What changes with the single-row model is a published query that someone started editing: it is **offline** (`409 QUERY_NOT_PUBLISHED`) until its editor publishes it again or discards it, and discard deletes it. That is why taking a published query offline is explicit (`"unpublish": true`, with a confirmation in the UI). What an open draft also holds is the per-`queryName` lock:
+- **Same author comes back** (new tab, browser crash, next day): `POST /engine/drafted` with `{ queryName }` returns the stored entry and the author continues with simulate, publish, or discard. Calling `draft` again also works, it overwrites the row in place.
+- **Different author** tries to draft the same `queryName`: gets `409 DRAFT_LOCKED` with the holder. A user with the `chief_DBA` role can force-discard the draft (not enforced yet).
+- **Nobody comes back**: nothing happens. Drafts do not expire, so the row and its lock stay until someone publishes or discards it (an earlier design had a 7-day TTL and a sweeper; both were removed). `discard` releases the lock.
 ### Example JSON
 
 `POST /engine/draft`
@@ -542,11 +597,11 @@ Response (`200`):
 
 ### Listing drafted and published queries
 
-`POST /engine/list` reads from both the Draft Store and the Published Query Store and merges them by `queryName`. A single query can be published and have an open draft for an edit-in-progress at the same time, so each entry has a `published` part and a `draft` part, and either can be `null`:
+`POST /engine/list` reads every row of `qe_stored_query`, one per `queryName`. A query is in exactly one state, so each entry has either a `published` part or a `draft` part, and the other is `null`:
 
-- Brand-new query, not published yet: `published: null`, `draft` set.
+- Brand-new query, not published yet: `published: null`, `draft` set (`state` is `drafted` or `simulated`).
 - Published query, nobody editing: `published` set, `draft: null`.
-- Published query with an edit in progress: both set.
+- Published query that someone is editing: `published: null`, `draft` set with `previouslyPublished: true`. The query is offline until it is published again.
 
 This `published`/`draft` pair is the general form of the drafted-vs-non-drafted distinction `/engine/drafted` surfaces for a single `queryName` — `list` shows it across every query at once. The list shows summaries only and leaves out SQL and the validated descriptor. To open a draft, call `POST /engine/drafted`. Callers see drafts from every author, so a `DRAFT_LOCKED` response can be traced to whoever holds the draft. Expired drafts drop out of the list once the sweeper removes them.
 
@@ -588,21 +643,14 @@ Response (`200`):
     },
     {
       "queryName": "orders.ordersByStatusAndBranch",
-      "published": {
-        "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
-        "params": [
-          { "name": "status", "type": "STRING" },
-          { "name": "branchId", "type": "INT" }
-        ],
-        "allowedRoles": ["senior_DBA", "chief_DBA"],
-        "publishedAt": "2026-10-07T10:15:00Z",
-        "publishedBy": "anirudhya.sarker@bracits.com"
-      },
+      "published": null,
       "draft": {
         "status": "VALIDATED",
+        "state": "simulated",
         "simulated": true,
         "author": "anirudhya.sarker@bracits.com",
-        "updatedAt": "2026-10-08T09:12:00Z"
+        "updatedAt": "2026-10-08T09:12:00Z",
+        "previouslyPublished": true
       }
     }
   ],
@@ -610,7 +658,7 @@ Response (`200`):
 }
 ```
 
-`draft.simulated` is `true` once a simulate has succeeded against the current draft, which means the draft can be published right away.
+`draft.simulated` is `true` once a simulate has succeeded against the current definition, which means it can be published right away. In the second item above, `orders.ordersByStatusAndBranch` was published, was taken offline for an edit, and has been simulated again, so it only needs publishing to go live.
 
 Error responses share one shape across all `/engine` endpoints:
 
@@ -626,8 +674,13 @@ Error responses share one shape across all `/engine` endpoints:
 | --- | --- | --- |
 | `INVALID_QUERY_NAME` | 400 | `queryName` missing from the body or not in `{module}.{name}` form |
 | `INVALID_ARGUMENT` | 400 | A param required by the validated query is missing from `params`, or has the wrong type |
-| `DRAFT_NOT_FOUND` | 404 | No open draft for `queryName` (never drafted, published, or discarded) — the non-drafted case |
+| `DRAFT_NOT_FOUND` | 404 | No open draft for `queryName` (never drafted, published, or discarded), the non-drafted case. Also answered for simulate, publish and discard on a `published` query |
 | `DRAFT_LOCKED` | 409 | Another author holds the open draft for `queryName` |
+| `QUERY_PUBLISHED` | 409 | Draft on a published query without `"unpublish": true` |
+| `DRAFT_CHANGED` | 409 | The row changed between reading it and writing the new state (a re-draft during a simulate, say); reload and retry |
+| `QUERY_NOT_PUBLISHED` | 409 | `/data-query` for a query that was published and is now being edited |
+| `SQL_INVALID` | 422 | The database rejected the SQL (at draft: stored as an error; at simulate: answer) |
+| `SQL_REJECTED` | 422 | The stored SQL no longer passes the SQL checks |
 | `DRAFT_INVALID` | 422 | Simulate on a draft with validation/param-declaration errors |
 | `NOT_SIMULATED` | 422 | Publish before the draft has been simulated |
 | `NO_ALLOWED_ROLES` | 422 | Publish with no roles or groups selected |
@@ -763,7 +816,7 @@ The OPA/Rego policy evaluation introduced in the Read Engine PRD carries over un
 
 ## Published query store additions
 
-As built, the published query store is the `query_engine.published_query` table; its exact columns are in "Current implementation (as built)". In design terms:
+As built, a published query is a row of `qe_stored_query` in state `published`; its columns are in "Query lifecycle". In design terms:
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -774,7 +827,7 @@ As built, the published query store is the `query_engine.published_query` table;
 | `allowedRoles` | string[] | `allowed_roles` chosen at publish — the operation-level gate |
 | `publishedAt` / `publishedBy` | timestamp / string | Audit trail |
 
-Status is implied by the table: anything in `published_query` is `PUBLISHED`; `DRAFT` and `VALIDATED` exist only in `drafted_query`. There is no separate `module` field; it is the part of `queryName` before the dot.
+Status is the row's `state`: only `published` rows are callable. There is no separate `module` field; it is the part of `queryName` before the dot.
 
 ## Open questions
 

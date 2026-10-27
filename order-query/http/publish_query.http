@@ -2,9 +2,10 @@
 ### Focused on two things: param validation (declaring params, missing/wrong-typed params at
 ### simulate time) and the drafted vs. non-drafted distinction (what /engine/drafted returns
 ### before a draft exists, while one is open, and after it's gone via discard/publish).
-### No versioning/revision concepts here -- drafting or publishing a queryName again simply
-### overwrites what was there before. All of this is backed by Postgres (drafted_query and
-### published_query tables) -- there is no in-memory state to lose on a restart.
+### A query is one row of the table qe_stored_query, in one of three states: drafted -> simulated ->
+### published. There is no versioning: drafting a queryName again overwrites its row (and clears
+### "simulated"), and a published query must be taken offline on purpose to be edited (step 8a).
+### Everything is in Postgres -- there is no in-memory state to lose on a restart.
 ###
 ### Content types: /engine/draft accepts and returns application/json. /engine/draft-yml is a
 ### separate endpoint for the same operation that accepts application/yaml and returns
@@ -20,7 +21,8 @@
 @author = senior_dba@bracits.com
 
 ### 0a. Query roles — the realm roles + groups catalog the UI offers at publish time (to choose
-### allowed_roles) and at run time (to pick a calling identity). Seeded by query-engine's schema.sql.
+### allowed_roles) and at run time (to pick a calling identity). From query-engine.roles in application.yml,
+### or the engine's built-in demo catalog when none is configured.
 GET {{baseUrl}}/query-roles
 
 ### 0. Drafted (resume) — 404 DRAFT_NOT_FOUND. Non-drafted: queryName has never been drafted.
@@ -31,7 +33,7 @@ Content-Type: application/json
   "queryName": "{{queryName}}"
 }
 
-### 1. Draft — validates the entry and opens a draft for queryName, persisted to drafted_query.
+### 1. Draft — validates the entry and opens a draft for queryName, stored with state drafted.
 POST {{baseUrl}}/engine/draft
 Content-Type: application/json
 X-Author: {{author}}
@@ -143,8 +145,8 @@ Content-Type: application/json
   "queryName": "orders.orderById"
 }
 
-### 7. Publish — happy path. queryName was simulated in step 4, so this succeeds, marks it
-### PUBLISHED (in published_query), and deletes the draft. allowed_roles mixes a realm role
+### 7. Publish — happy path. queryName was simulated in step 4, so this succeeds and moves the
+### row to state published. allowed_roles mixes a realm role
 ### (senior_DBA) and a group (data-platform); both are enforced by name at invoke time.
 POST {{baseUrl}}/engine/publish
 Content-Type: application/json
@@ -155,10 +157,8 @@ X-Author: {{author}}
   "allowed_roles": ["senior_DBA", "data-platform"]
 }
 
-### 7a. Drafted (resume) — non-drafted case: 404 DRAFT_NOT_FOUND. Publish (step 7) deleted the
-### draft; queryName is now published but has no open draft, which /engine/drafted does not see
-### (it only looks at drafted_query, not published_query -- see /engine/list for a view that
-### shows both).
+### 7a. Drafted (resume) — 404 DRAFT_NOT_FOUND. queryName is published, not a draft, so there is
+### nothing to resume (see /engine/list for a view of every query and its state).
 POST {{baseUrl}}/engine/drafted
 Content-Type: application/json
 
@@ -166,8 +166,8 @@ Content-Type: application/json
   "queryName": "{{queryName}}"
 }
 
-### 8. Draft — 409 DRAFT_LOCKED. Drafting queryName again as a different author while an open
-### draft is held by someone else returns a conflict. We first open a new draft as {{author}} ...
+### 8. Draft over a published query — 409 QUERY_PUBLISHED. A live query is never taken offline by
+### accident: drafting it again needs "unpublish": true.
 POST {{baseUrl}}/engine/draft
 Content-Type: application/json
 X-Author: {{author}}
@@ -178,8 +178,32 @@ X-Author: {{author}}
   "params": { "status": "String", "branchId": "int" }
 }
 
-### 8a. ... then a different author tries to draft the same queryName and gets 409 DRAFT_LOCKED
-### (holder + expiresAt reported back).
+### 8a. ... with "unpublish": true it is accepted. The query goes back to state drafted and is OFFLINE
+### until it is simulated and published again. The response has previouslyPublished: true and the
+### roles chosen last time in allowedRoles.
+POST {{baseUrl}}/engine/draft
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "{{queryName}}",
+  "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
+  "params": { "status": "String", "branchId": "int" },
+  "unpublish": true
+}
+
+### 8b. A caller now gets 409 QUERY_NOT_PUBLISHED ("being edited"), not a 404.
+POST {{baseUrl}}/data-query
+Content-Type: application/json
+X-Roles: senior_DBA
+
+{
+  "name": "{{queryName}}",
+  "params": { "status": "SHIPPED", "branchId": 12 }
+}
+
+### 8c. A different author tries to draft the same queryName and gets 409 DRAFT_LOCKED (the holder
+### is named in the message). The draft stays locked until its holder publishes or discards it.
 POST {{baseUrl}}/engine/draft
 Content-Type: application/json
 X-Author: another.dba@bracits.com
@@ -187,16 +211,28 @@ X-Author: another.dba@bracits.com
 {
   "queryName": "{{queryName}}",
   "sql": "SELECT orderId, status, total, branchId FROM order_projection WHERE status = :status AND branchId = :branchId",
-  "params": { "status": "String", "branchId": "int" }
+  "params": { "status": "String", "branchId": "int" },
+  "unpublish": true
 }
 
-### 9. Discard — releases the draft opened in step 8, back to just queryName PUBLISHED with
-### nothing in progress.
-POST {{baseUrl}}/engine/discard
+### 9. Simulate again (the edit cleared "simulated") ...
+POST {{baseUrl}}/engine/simulate
 Content-Type: application/json
 
 {
-  "queryName": "{{queryName}}"
+  "queryName": "{{queryName}}",
+  "params": { "status": "SHIPPED", "branchId": 12 }
+}
+
+### 9a. ... and publish again: the query is live again. (Discard instead would delete it
+### completely, because the row is the only copy.)
+POST {{baseUrl}}/engine/publish
+Content-Type: application/json
+X-Author: {{author}}
+
+{
+  "queryName": "{{queryName}}",
+  "allowed_roles": ["senior_DBA", "data-platform"]
 }
 
 ### 10. Draft — 400 INVALID_QUERY_NAME. Name isn't in "{module}.{name}" form.
@@ -210,8 +246,8 @@ X-Author: {{author}}
   "params": {}
 }
 
-### 11. List — queryName is now PUBLISHED with no open draft; confirms the "published set,
-### draft: null" shape described in the PRD.
+### 11. List — one item per query with its single state: queryName is published here (published set,
+### draft: null). A query being edited would have published: null and a draft with its state.
 POST {{baseUrl}}/engine/list
 Content-Type: application/json
 
