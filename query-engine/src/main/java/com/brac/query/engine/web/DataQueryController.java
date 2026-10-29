@@ -20,18 +20,16 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Phase 2 runtime invocation endpoint from the PRD, reactive end to end. This PoC stands in the
+ * Phase 2 runtime invocation endpoints, reactive end to end. This PoC stands in the
  * caller's roles with the X-Roles header rather than a real JWT, since no auth stack exists yet.
  *
- * <p>The response format follows the {@code Accept} header:
  * <ul>
- *   <li>{@code application/x-ndjson}: every row, one JSON object per line, written as the client
- *       reads them (backpressure reaches the database cursor);</li>
- *   <li>{@code application/json}, {@code *}{@code /*} or no header: a JSON array of at most
- *       {@code query-engine.stream.json-max-rows} rows, {@code 413} beyond that.</li>
+ *   <li>{@code /data-query}: executes queries reactively with R2DBC directly, excluding database
+ *       cursors and streaming chunking. Returns a JSON array of rows.</li>
+ *   <li>{@code /data-query-streaming}: serves runtime invocation in a streaming setting utilizing
+ *       reactive API + R2DBC + database cursor. Supports {@code application/x-ndjson} for streaming
+ *       as rows are consumed, or {@code application/json} bounded by {@code query-engine.stream.json-max-rows}.</li>
  * </ul>
- * Everything that can fail cheaply (unknown query, role, params, a database error before the first
- * row) is answered with a normal JSON error in both formats.
  */
 @RestController
 public class DataQueryController {
@@ -42,16 +40,30 @@ public class DataQueryController {
         this.service = service;
     }
 
-    @PostMapping("/data-query")
-    public Mono<ResponseEntity<?>> invoke(@Valid @RequestBody DataQueryRequest request,
-                                          @RequestHeader(value = "X-Roles", defaultValue = "senior_DBA") String rolesHeader,
-                                          ServerWebExchange exchange) {
-        boolean ndjson = wantsNdjson(exchange.getRequest().getHeaders());
+    /**
+     * Executes a published query reactively with R2DBC without a database cursor or streaming.
+     * Returns all rows as a JSON list.
+     */
+    @PostMapping(path = "/data-query", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<List<Map<String, Object>>>> invoke(@Valid @RequestBody DataQueryRequest request,
+                                                                  @RequestHeader(value = "X-Roles", defaultValue = "senior_DBA") String rolesHeader) {
+        List<String> roles = parseRoles(rolesHeader);
+        Map<String, Object> params = request.params() == null ? Map.of() : request.params();
 
-        List<String> roles = Arrays.stream(rolesHeader.split(","))
-                .map(String::trim)
-                .filter(r -> !r.isEmpty())
-                .toList();
+        return service.prepare(request.name(), params, roles)
+                .flatMap(invocation -> service.executeDirect(invocation, roles))
+                .map(ResponseEntity::ok);
+    }
+
+    /**
+     * Streaming runtime invocation utilizing reactive API + R2DBC + database cursor.
+     */
+    @PostMapping("/data-query-streaming")
+    public Mono<ResponseEntity<?>> invokeStreaming(@Valid @RequestBody DataQueryRequest request,
+                                                   @RequestHeader(value = "X-Roles", defaultValue = "senior_DBA") String rolesHeader,
+                                                   ServerWebExchange exchange) {
+        boolean ndjson = wantsNdjson(exchange.getRequest().getHeaders());
+        List<String> roles = parseRoles(rolesHeader);
         Map<String, Object> params = request.params() == null ? Map.of() : request.params();
 
         return service.prepare(request.name(), params, roles).flatMap(invocation -> {
@@ -65,6 +77,16 @@ public class DataQueryController {
             }
             return service.bounded(invocation, roles).map(rows -> ResponseEntity.ok(rows));
         });
+    }
+
+    private static List<String> parseRoles(String rolesHeader) {
+        if (rolesHeader == null || rolesHeader.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(rolesHeader.split(","))
+                .map(String::trim)
+                .filter(r -> !r.isEmpty())
+                .toList();
     }
 
     /**

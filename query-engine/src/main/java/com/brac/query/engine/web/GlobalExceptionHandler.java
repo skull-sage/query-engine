@@ -31,9 +31,12 @@ public class GlobalExceptionHandler {
         return response.body(new ErrorResponse(ex.getCode(), ex.getMessage(), ex.getQueryName()));
     }
 
-    @ExceptionHandler(MethodArgumentNotValidException.class)
-    public ResponseEntity<ErrorResponse> handleValidation(MethodArgumentNotValidException ex) {
-        String message = ex.getBindingResult().getFieldErrors().stream()
+    @ExceptionHandler({MethodArgumentNotValidException.class, org.springframework.web.bind.support.WebExchangeBindException.class})
+    public ResponseEntity<ErrorResponse> handleValidation(Exception ex) {
+        org.springframework.validation.BindingResult bindingResult = (ex instanceof org.springframework.web.bind.support.WebExchangeBindException webe)
+                ? webe.getBindingResult()
+                : ((MethodArgumentNotValidException) ex).getBindingResult();
+        String message = bindingResult.getFieldErrors().stream()
                 .findFirst()
                 .map(fe -> fe.getField() + " " + fe.getDefaultMessage())
                 .orElse("Invalid request");

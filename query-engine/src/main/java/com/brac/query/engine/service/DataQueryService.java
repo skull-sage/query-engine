@@ -47,6 +47,26 @@ public class DataQueryService {
     }
 
     /**
+     * Reads all rows for the published query reactively using R2DBC without a database cursor
+     * or streaming chunking. Executes the query directly inside BEGIN READ ONLY and collects
+     * all rows into a list.
+     */
+    public Mono<List<Map<String, Object>>> executeDirect(Invocation invocation, List<String> callerRoles) {
+        return Mono.defer(() -> {
+            Call call = new Call("direct", invocation, callerRoles, 0);
+            return executor.executeDirect(invocation.queryName(), invocation.query(), invocation.params())
+                    .onErrorMap(ProjectionException.class, e -> e.toEngineException(invocation.queryName(), false))
+                    .doOnError(call::failed)
+                    .doOnCancel(call::cancelled)
+                    .doOnSuccess(rows -> {
+                        call.rows.set(rows.size());
+                        call.completed();
+                    })
+                    .doFinally(signal -> call.log());
+        });
+    }
+
+    /**
      * All rows, as fast as the client reads them. Errors before the first row (database rejects the
      * SQL, no connection in time) surface as {@link EngineException} so they can still be answered
      * with a normal JSON error; after the first row they abort the connection.

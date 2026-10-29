@@ -39,7 +39,7 @@ export const DOMAINS = [
       modeVar: 'VITE_ORDER_QUERY_MODE',
     }),
     queryModule: 'orders',
-    // The Downstream demo page (nav item) streams this query from /data-query to show a slow
+    // The Streaming demo page (nav item) streams this query from /data-query-streaming to show a slow
     // consumer being served without the service buffering the result. The page creates and
     // publishes the query itself if it isn't there yet. Needs order_history_projection
     // (order-query/docker/init/02_order_history_projection.sql, 50,000 rows).
@@ -52,6 +52,22 @@ ORDER BY order_id`,
       params: { since: 'date' },
       fetchSize: 100,
       args: { since: '2026-01-01' },
+      role: 'data-platform',
+      expectedRows: 50000,
+      idField: 'order_id',
+      idPrefix: 'H-',
+    },
+    // The Plain batch demo page (nav item) loads data in batches via POST /data-query (non-streaming,
+    // no cursor) using SQL LIMIT and OFFSET. Fetch size corresponds directly to the LIMIT size.
+    batchDemo: {
+      queryName: 'orders.historyByBatch',
+      sql: `SELECT order_id, customer_id, branch_id, status, channel, customer_tier, order_date, total, notes
+FROM order_history_projection
+WHERE order_date >= :since
+ORDER BY order_id
+LIMIT :limit OFFSET :offset`,
+      params: { since: 'date', limit: 'int', offset: 'int' },
+      args: { since: '2026-01-01', limit: 100, offset: 0 },
       role: 'data-platform',
       expectedRows: 50000,
       idField: 'order_id',

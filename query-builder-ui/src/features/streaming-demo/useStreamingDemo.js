@@ -37,7 +37,7 @@ function sleep(ms, signal) {
 }
 
 /**
- * Plays a slow downstream consumer. It calls POST /data-query with Accept: application/x-ndjson,
+ * Plays a slow streaming consumer. It calls POST /data-query-streaming with Accept: application/x-ndjson,
  * then takes `batchSize` rows, "processes" them for `delayMs`, and only then reads more. The
  * service is never told to slow down explicitly: the browser stops reading, TCP's window fills,
  * and the service's database cursor stops being fetched. Only counters are kept (no rows), so a
@@ -47,7 +47,7 @@ function sleep(ms, signal) {
  * demo query is published, then streams it. Leaving the page aborts the request, which also
  * releases the service's database connection.
  */
-export function useDownstreamDemo({ client, demo }) {
+export function useStreamingDemo({ client, demo }) {
   const [settings, setSettings] = useState(DEFAULT_SETTINGS)
   const settingsRef = useRef(settings)
   const [run, setRun] = useState(INITIAL)

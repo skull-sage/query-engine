@@ -19,11 +19,13 @@ export default function AppHeader() {
     requestLeave(() => navigate(`/${key}`))
   }
 
-  const onDemo = pathname.endsWith('/downstream-demo')
+  const onStreamDemo = pathname.endsWith('/streaming-demo')
+  const onBatchDemo = pathname.endsWith('/plain-batch-demo')
   const navItems = current
     ? [
-        { label: 'Queries', to: `/${current.key}`, active: !onDemo },
-        ...(current.streamDemo ? [{ label: 'Downstream demo', to: `/${current.key}/downstream-demo`, active: onDemo }] : []),
+        { label: 'Queries', to: `/${current.key}`, active: !onStreamDemo && !onBatchDemo },
+        ...(current.streamDemo ? [{ label: 'Streaming demo', to: `/${current.key}/streaming-demo`, active: onStreamDemo }] : []),
+        ...(current.batchDemo ? [{ label: 'Plain batch demo', to: `/${current.key}/plain-batch-demo`, active: onBatchDemo }] : []),
       ]
     : []
 

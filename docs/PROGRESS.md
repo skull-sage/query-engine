@@ -313,6 +313,31 @@ table" below.
 - Not verified: streaming through proxy mode, and the abort propagation hook (written, not exercised); `dry-run.sh` with the variable
   exported was not run end to end (the dev server was started by hand with the variable).
 
+## Endpoint Separation & Concurrency Benchmark: Plain Batch vs Reactive Streaming (2026-10-29)
+
+- **Backend Endpoint Separation (`query-engine`)**:
+  - The reactive streaming endpoint was renamed from `/data-query` to `@PostMapping("/data-query-streaming")`, preserving reactive cursor streaming (`application/x-ndjson`) with R2DBC statement `fetchSize`.
+  - Implemented `@PostMapping(path = "/data-query", produces = MediaType.APPLICATION_JSON_VALUE)` executing non-streaming reactive queries using Spring Data R2DBC (`executeDirect`) returning standard JSON arrays (`List<Map<String, Object>>`), excluding database cursors and chunked framing.
+  - Added `executeDirect` in `DataQueryService` and `ProjectionStoreExecutor`.
+  - Updated `GlobalExceptionHandler` to handle Spring WebFlux `WebExchangeBindException` alongside `MethodArgumentNotValidException`.
+  - Added unit test suite in `DataQueryControllerTest.java` (all 145 backend tests pass).
+  - Published updated library to Maven Local (`cd query-engine && ./gradlew publishToMavenLocal`).
+
+- **Frontend Visualization (`query-builder-ui`)**:
+  - Renamed `features/downstream-demo` to `features/streaming-demo` (`StreamingDemoPage.jsx`, `useStreamingDemo.js`) and updated UI routing to target `/data-query-streaming`.
+  - Created `features/plain-batch-demo/PlainBatchDemoPage.jsx` and `usePlainBatchDemo.js` to visualize paginated batch loading against `/data-query`, featuring bidirectional synchronization between UI fetch size and SQL `LIMIT` / `OFFSET`.
+  - Added unit tests in `usePlainBatchDemo.test.js` (all 134 frontend tests pass, production Vite build succeeds).
+
+- **Performance & Concurrency Audit (`scripts/benchmark-cpu-mem.mjs`)**:
+  - Built an automated, non-invasive benchmarking tool using an out-of-band Docker daemon stats stream (`docker stats --format '{{json .}}'`) to monitor `order-query-app` and `order-query-postgres` with zero in-container agent overhead.
+  - Implemented strict sequential isolation with 4-second cooldown intervals between tests to eliminate GC and connection pool interference.
+  - Evaluated concurrency scaling across 10, 40, 50, and 100 concurrent clients fetching 3,000 rows with a fixed batch size of 100 rows.
+  - **Key Empirical Findings**:
+    - **PostgreSQL CPU**: Streaming saves up to 68% PostgreSQL CPU at 100 concurrency (24.8% vs 78.7%) by eliminating the $O(N)$ row-scanning penalty of repeated SQL `OFFSET` traversals.
+    - **Application CPU**: Streaming reduces application CPU by ~37% under burst load by replacing 3,000 separate HTTP request-response cycles with 100 persistent chunked NDJSON streams.
+    - **Memory Stability**: Both approaches exhibit bounded, stable JVM heap utilization (~855–865 MiB).
+  - Detailed methodology, power tables, and architectural analysis are documented in [docs/benchmark_batch_vs_streaming_concurrency.md](file:///Volumes/work-space/brac-v3/generic-query/docs/benchmark_batch_vs_streaming_concurrency.md).
+
 ## Possible next steps
 
 - Fix the 77.8% halt (open issue 1: `statement_timeout` on streams, the dev proxy hiding aborts, a page-side watchdog).

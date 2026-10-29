@@ -5,7 +5,7 @@ import CopyButton from '../../components/CopyButton.jsx'
 import Spinner from '../../components/Spinner.jsx'
 import { useDomain } from '../../context/DomainContext.jsx'
 import Sparkline from './Sparkline.jsx'
-import { LOG_BATCHES as LOG_BATCHES_SHOWN, useDownstreamDemo } from './useDownstreamDemo.js'
+import { LOG_BATCHES as LOG_BATCHES_SHOWN, useStreamingDemo } from './useStreamingDemo.js'
 import { samplesToCsv, useResourceMonitor } from './useResourceMonitor.js'
 import { useServiceAvailability } from './useServiceAvailability.js'
 
@@ -23,14 +23,14 @@ const PHASE_LABEL = {
 }
 
 /**
- * Downstream demo: a deliberately slow consumer of /data-query, with a live view of what the run
+ * Streaming demo: a deliberately slow consumer of /data-query-streaming, with a live view of what the run
  * costs. Nothing happens until "Run query" is pressed. Top: the run controls. Below, two columns:
  * what the run is doing (left) and the resources it is using (right).
  */
-export default function DownstreamDemoPage() {
+export default function StreamingDemoPage() {
   const { domain, client } = useDomain()
   const demo = domain.streamDemo
-  const { run, runKey, rowsRef, settings, updateSettings, start, stop } = useDownstreamDemo({ client, demo })
+  const { run, runKey, rowsRef, settings, updateSettings, start, stop } = useStreamingDemo({ client, demo })
   const availability = useServiceAvailability(client)
 
   const active = run.phase === 'preparing' || run.phase === 'streaming'
@@ -51,9 +51,9 @@ export default function DownstreamDemoPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-xl font-semibold text-slate-900">Downstream demo</h1>
+        <h1 className="text-xl font-semibold text-slate-900">Streaming demo</h1>
         <p className="mt-1 max-w-3xl text-sm text-slate-600">
-          Calls <code className="font-mono text-xs">{demo.queryName}</code> on {domain.service} as a slow downstream system: it reads a batch of
+          Calls <code className="font-mono text-xs">{demo.queryName}</code> on {domain.service} as a slow streaming consumer: it reads a batch of
           rows, pauses, then reads more. The service sends rows only as fast as they are read, so its memory stays flat and its database
           cursor advances at this pace.
         </p>

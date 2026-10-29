@@ -5,7 +5,8 @@ import { DomainProvider } from './context/DomainContext.jsx'
 import { LeaveGuardProvider } from './context/LeaveGuard.jsx'
 import { findDomain } from './domains.js'
 import { LAST_DOMAIN_STORAGE_KEY } from './config.js'
-import DownstreamDemoPage from './features/downstream-demo/DownstreamDemoPage.jsx'
+import StreamingDemoPage from './features/streaming-demo/StreamingDemoPage.jsx'
+import PlainBatchDemoPage from './features/plain-batch-demo/PlainBatchDemoPage.jsx'
 import DomainSelectPage from './pages/DomainSelectPage.jsx'
 import QueryListPage from './pages/QueryListPage.jsx'
 
@@ -19,7 +20,9 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/:domainKey" element={<DomainWorkspace />}>
               <Route index element={<QueryListPage />} />
-              <Route path="downstream-demo" element={<DownstreamDemo />} />
+              <Route path="streaming-demo" element={<StreamingDemo />} />
+              <Route path="downstream-demo" element={<Navigate to="../streaming-demo" replace />} />
+              <Route path="plain-batch-demo" element={<PlainBatchDemo />} />
               <Route path="*" element={<Navigate to=".." replace />} />
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
@@ -56,12 +59,20 @@ function DomainWorkspace() {
   )
 }
 
-/** The Downstream demo only exists for domains that configure a streamDemo (see domains.js). */
-function DownstreamDemo() {
+/** The Streaming demo only exists for domains that configure a streamDemo (see domains.js). */
+function StreamingDemo() {
   const { domainKey } = useParams()
   const domain = findDomain(domainKey)
   if (!domain?.streamDemo) return <Navigate to={`/${domainKey}`} replace />
-  return <DownstreamDemoPage />
+  return <StreamingDemoPage />
+}
+
+/** The Plain batch demo loads data in batches using the new POST /data-query endpoint. */
+function PlainBatchDemo() {
+  const { domainKey } = useParams()
+  const domain = findDomain(domainKey)
+  if (!domain?.batchDemo && !domain?.streamDemo) return <Navigate to={`/${domainKey}`} replace />
+  return <PlainBatchDemoPage />
 }
 
 function readLastDomain() {

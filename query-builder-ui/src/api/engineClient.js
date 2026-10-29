@@ -189,14 +189,14 @@ export function createEngineClient({ baseUrl, serviceLabel, serviceUrl = baseUrl
       request('/data-query', { body: { name, params }, headers: { 'X-Roles': roles }, ...opts }),
 
     /**
-     * POST /data-query with Accept: application/x-ndjson. Resolves with the Response once the
+     * POST /data-query-streaming with Accept: application/x-ndjson. Resolves with the Response once the
      * status is known (non-2xx is thrown as an EngineError before any body is read); the caller
      * reads response.body at its own pace, and the server only sends as fast as it is read.
      */
     openStream: async (name, params, roles, { signal } = {}) => {
       let res
       try {
-        res = await fetch(`${baseUrl}/data-query`, {
+        res = await fetch(`${baseUrl}/data-query-streaming`, {
           method: 'POST',
           headers: { Accept: 'application/x-ndjson', 'Content-Type': 'application/json', 'X-Roles': roles },
           body: JSON.stringify({ name, params }),

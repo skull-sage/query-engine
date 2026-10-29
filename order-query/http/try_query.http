@@ -81,7 +81,7 @@ Content-Type: application/json
 ### simulate and publish orders.historyByDate with fetchSize 100 and allowed role data-platform).
 ### Accept: application/x-ndjson streams one row per line, read from Postgres only as fast as the
 ### client reads. Without it, the same call returns 413 RESULT_TOO_LARGE (JSON is capped at 1000 rows).
-POST {{baseUrl}}/data-query
+POST {{baseUrl}}/data-query-streaming
 Content-Type: application/json
 Accept: application/x-ndjson
 X-Roles: data-platform

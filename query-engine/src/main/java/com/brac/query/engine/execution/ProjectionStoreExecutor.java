@@ -57,6 +57,17 @@ public class ProjectionStoreExecutor {
         this.projectionDatabaseClient = projectionDatabaseClient;
     }
 
+    private DatabaseClient.GenericExecuteSpec bindSpec(String queryName, ValidatedQuery query, Map<String, Object> args) {
+        DatabaseClient.GenericExecuteSpec spec = projectionDatabaseClient.databaseClient().sql(query.sql());
+        for (ParamSpec paramSpec : query.params()) {
+            Object value = coerce(queryName, paramSpec, args.get(paramSpec.name()));
+            spec = (value == null)
+                    ? spec.bindNull(paramSpec.name(), javaType(paramSpec.type()))
+                    : spec.bind(paramSpec.name(), value);
+        }
+        return spec;
+    }
+
     /**
      * Streams the query's rows. Nothing runs until subscribed. Errors are
      * {@link EngineException} (bad argument values) or {@link ProjectionException} (database
@@ -64,18 +75,24 @@ public class ProjectionStoreExecutor {
      */
     public Flux<Map<String, Object>> stream(String queryName, ValidatedQuery query, Map<String, Object> args, int fetchSize) {
         return Flux.defer(() -> {
-            DatabaseClient.GenericExecuteSpec spec = projectionDatabaseClient.databaseClient().sql(query.sql());
-            for (ParamSpec paramSpec : query.params()) {
-                Object value = coerce(queryName, paramSpec, args.get(paramSpec.name()));
-                spec = (value == null)
-                        ? spec.bindNull(paramSpec.name(), javaType(paramSpec.type()))
-                        : spec.bind(paramSpec.name(), value);
-            }
+            DatabaseClient.GenericExecuteSpec spec = bindSpec(queryName, query, args);
             if (fetchSize > 0) {
                 spec = spec.filter(statement -> statement.fetchSize(fetchSize));
             }
             // The author's SQL only ever runs inside BEGIN READ ONLY (see ProjectionDatabaseClient).
             return projectionDatabaseClient.inReadOnlyTransaction(spec.map(ProjectionStoreExecutor::toRow).all());
+        }).onErrorMap(ProjectionStoreExecutor::translate);
+    }
+
+    /**
+     * Executes the query reactively using R2DBC without a database cursor or streaming,
+     * collecting all rows into a list. Runs inside BEGIN READ ONLY.
+     */
+    public Mono<List<Map<String, Object>>> executeDirect(String queryName, ValidatedQuery query, Map<String, Object> args) {
+        return Mono.defer(() -> {
+            DatabaseClient.GenericExecuteSpec spec = bindSpec(queryName, query, args);
+            return projectionDatabaseClient.inReadOnlyTransaction(spec.map(ProjectionStoreExecutor::toRow).all())
+                    .collectList();
         }).onErrorMap(ProjectionStoreExecutor::translate);
     }
 
